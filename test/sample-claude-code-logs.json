@@ -1,0 +1,199 @@
+{
+  "resourceLogs": [
+    {
+      "resource": {
+        "attributes": [
+          { "key": "service.name",    "value": { "stringValue": "claude-code" } },
+          { "key": "service.version", "value": { "stringValue": "2.1.287" } }
+        ]
+      },
+      "scopeLogs": [
+        {
+          "scope": { "name": "com.anthropic.claude_code.events", "version": "2.1.287" },
+          "logRecords": [
+            {
+              "timeUnixNano": "1760700000000000000",
+              "severityNumber": 0, "severityText": "INFO",
+              "body": { "stringValue": "claude_code.user_prompt" },
+              "attributes": [
+                { "key": "event.name",    "value": { "stringValue": "user_prompt" } },
+                { "key": "session.id",    "value": { "stringValue": "smoke-session-001" } },
+                { "key": "prompt.id",     "value": { "stringValue": "p-0001" } },
+                { "key": "prompt_length", "value": { "stringValue": "42" } }
+              ]
+            },
+            {
+              "timeUnixNano": "1760700001000000000",
+              "severityNumber": 0, "severityText": "INFO",
+              "body": { "stringValue": "claude_code.api_request" },
+              "attributes": [
+                { "key": "event.name",            "value": { "stringValue": "api_request" } },
+                { "key": "session.id",            "value": { "stringValue": "smoke-session-001" } },
+                { "key": "prompt.id",             "value": { "stringValue": "p-0001" } },
+                { "key": "model",                 "value": { "stringValue": "claude-fable-5-1" } },
+                { "key": "input_tokens",          "value": { "intValue": "2" } },
+                { "key": "output_tokens",         "value": { "intValue": "803" } },
+                { "key": "cache_read_tokens",     "value": { "intValue": "77013" } },
+                { "key": "cache_creation_tokens", "value": { "intValue": "2739" } },
+                { "key": "cost_usd",              "value": { "doubleValue": 0.11420325 } },
+                { "key": "cost_usd_micros",       "value": { "intValue": "114203" } },
+                { "key": "duration_ms",           "value": { "intValue": "15819" } },
+                { "key": "ttft_ms",               "value": { "intValue": "3015" } },
+                { "key": "request_id",            "value": { "stringValue": "req_smoke_0001" } },
+                { "key": "speed",                 "value": { "stringValue": "normal" } },
+                { "key": "effort",                "value": { "stringValue": "high" } },
+                { "key": "query_source",          "value": { "stringValue": "repl_main_thread" } }
+              ]
+            },
+            {
+              "timeUnixNano": "1760700002000000000",
+              "severityNumber": 0, "severityText": "INFO",
+              "body": { "stringValue": "claude_code.api_request" },
+              "attributes": [
+                { "key": "event.name",   "value": { "stringValue": "api_request" } },
+                { "key": "session.id",   "value": { "stringValue": "smoke-session-001" } },
+                { "key": "model",        "value": { "stringValue": "claude-haiku-4-5-20251001" } },
+                { "key": "input_tokens", "value": { "intValue": "1218" } },
+                { "key": "output_tokens","value": { "intValue": "14" } },
+                { "key": "cache_read_tokens",     "value": { "intValue": "0" } },
+                { "key": "cache_creation_tokens", "value": { "intValue": "0" } },
+                { "key": "cost_usd",     "value": { "doubleValue": 0.001288 } },
+                { "key": "duration_ms",  "value": { "intValue": "1535" } },
+                { "key": "ttft_ms",      "value": { "intValue": "1459" } },
+                { "key": "query_source", "value": { "stringValue": "generate_session_title" } }
+              ]
+            },
+            {
+              "timeUnixNano": "1760700003000000000",
+              "severityNumber": 0, "severityText": "INFO",
+              "body": { "stringValue": "claude_code.tool_decision" },
+              "attributes": [
+                { "key": "event.name",  "value": { "stringValue": "tool_decision" } },
+                { "key": "session.id",  "value": { "stringValue": "smoke-session-001" } },
+                { "key": "tool_name",   "value": { "stringValue": "Read" } },
+                { "key": "tool_use_id", "value": { "stringValue": "toolu_smoke_read_1" } },
+                { "key": "decision",    "value": { "stringValue": "accept" } },
+                { "key": "source",      "value": { "stringValue": "config" } },
+                { "key": "tool_source", "value": { "stringValue": "builtin" } }
+              ]
+            },
+            {
+              "timeUnixNano": "1760700004000000000",
+              "severityNumber": 0, "severityText": "INFO",
+              "body": { "stringValue": "claude_code.tool_result" },
+              "attributes": [
+                { "key": "event.name",             "value": { "stringValue": "tool_result" } },
+                { "key": "session.id",             "value": { "stringValue": "smoke-session-001" } },
+                { "key": "tool_name",              "value": { "stringValue": "Read" } },
+                { "key": "tool_use_id",            "value": { "stringValue": "toolu_smoke_read_1" } },
+                { "key": "success",                "value": { "stringValue": "true" } },
+                { "key": "duration_ms",            "value": { "stringValue": "10" } },
+                { "key": "tool_input",             "value": { "stringValue": "{\"file_path\":\"/repo/src/app.ts\"}" } },
+                { "key": "tool_input_size_bytes",  "value": { "stringValue": "31" } },
+                { "key": "tool_result_size_bytes", "value": { "stringValue": "16918" } },
+                { "key": "decision_source",        "value": { "stringValue": "config" } },
+                { "key": "decision_type",          "value": { "stringValue": "accept" } }
+              ]
+            },
+            {
+              "timeUnixNano": "1760700005000000000",
+              "severityNumber": 0, "severityText": "INFO",
+              "body": { "stringValue": "claude_code.tool_result" },
+              "attributes": [
+                { "key": "event.name",             "value": { "stringValue": "tool_result" } },
+                { "key": "session.id",             "value": { "stringValue": "smoke-session-001" } },
+                { "key": "tool_name",              "value": { "stringValue": "Bash" } },
+                { "key": "tool_use_id",            "value": { "stringValue": "toolu_smoke_bash_1" } },
+                { "key": "success",                "value": { "stringValue": "true" } },
+                { "key": "duration_ms",            "value": { "stringValue": "984" } },
+                { "key": "tool_input",             "value": { "stringValue": "{\"command\":\"git add -A && git commit -m 'feat: events layer'\",\"description\":\"Commit the change\"}" } },
+                { "key": "tool_result_size_bytes", "value": { "stringValue": "212" } }
+              ]
+            },
+            {
+              "timeUnixNano": "1760700006000000000",
+              "severityNumber": 0, "severityText": "INFO",
+              "body": { "stringValue": "claude_code.tool_result" },
+              "attributes": [
+                { "key": "event.name",             "value": { "stringValue": "tool_result" } },
+                { "key": "session.id",             "value": { "stringValue": "smoke-session-001" } },
+                { "key": "tool_name",              "value": { "stringValue": "Bash" } },
+                { "key": "tool_use_id",            "value": { "stringValue": "toolu_smoke_bash_2" } },
+                { "key": "success",                "value": { "stringValue": "false" } },
+                { "key": "error_type",             "value": { "stringValue": "ShellError" } },
+                { "key": "duration_ms",            "value": { "stringValue": "2091" } },
+                { "key": "tool_input",             "value": { "stringValue": "{\"command\":\"npm test -- --run\",\"description\":\"Run the unit tests\"}" } },
+                { "key": "tool_result_size_bytes", "value": { "stringValue": "4096" } }
+              ]
+            },
+            {
+              "timeUnixNano": "1760700007000000000",
+              "severityNumber": 0, "severityText": "INFO",
+              "body": { "stringValue": "claude_code.api_error" },
+              "attributes": [
+                { "key": "event.name",  "value": { "stringValue": "api_error" } },
+                { "key": "session.id",  "value": { "stringValue": "smoke-session-001" } },
+                { "key": "model",       "value": { "stringValue": "claude-fable-5-1" } },
+                { "key": "status_code", "value": { "intValue": "529" } },
+                { "key": "attempt",     "value": { "intValue": "2" } },
+                { "key": "duration_ms", "value": { "intValue": "812" } },
+                { "key": "error",       "value": { "stringValue": "overloaded_error" } }
+              ]
+            },
+            {
+              "timeUnixNano": "1760700008000000000",
+              "severityNumber": 0, "severityText": "INFO",
+              "body": { "stringValue": "claude_code.hook_execution_complete" },
+              "attributes": [
+                { "key": "event.name",   "value": { "stringValue": "hook_execution_complete" } },
+                { "key": "session.id",   "value": { "stringValue": "smoke-session-001" } },
+                { "key": "hook_event",   "value": { "stringValue": "PreToolUse" } },
+                { "key": "hook_name",    "value": { "stringValue": "PreToolUse:Bash" } },
+                { "key": "num_hooks",    "value": { "stringValue": "1" } },
+                { "key": "num_blocking", "value": { "stringValue": "1" } }
+              ]
+            },
+            {
+              "timeUnixNano": "1760700009000000000",
+              "severityNumber": 0, "severityText": "INFO",
+              "body": { "stringValue": "claude_code.compaction" },
+              "attributes": [
+                { "key": "event.name",  "value": { "stringValue": "compaction" } },
+                { "key": "session.id",  "value": { "stringValue": "smoke-session-001" } },
+                { "key": "trigger",     "value": { "stringValue": "manual" } },
+                { "key": "success",     "value": { "stringValue": "true" } },
+                { "key": "duration_ms", "value": { "stringValue": "179593" } },
+                { "key": "pre_tokens",  "value": { "stringValue": "108829" } },
+                { "key": "post_tokens", "value": { "stringValue": "17713" } }
+              ]
+            },
+            {
+              "timeUnixNano": "1760700010000000000",
+              "severityNumber": 0, "severityText": "INFO",
+              "body": { "stringValue": "claude_code.subagent_completed" },
+              "attributes": [
+                { "key": "event.name",  "value": { "stringValue": "subagent_completed" } },
+                { "key": "session.id",  "value": { "stringValue": "smoke-session-001" } },
+                { "key": "agent_type",  "value": { "stringValue": "general-purpose" } },
+                { "key": "model",       "value": { "stringValue": "claude-sonnet-5-5" } },
+                { "key": "duration_ms", "value": { "intValue": "24338" } }
+              ]
+            },
+            {
+              "timeUnixNano": "1760700011000000000",
+              "severityNumber": 0, "severityText": "INFO",
+              "body": { "stringValue": "claude_code.permission_mode_changed" },
+              "attributes": [
+                { "key": "event.name", "value": { "stringValue": "permission_mode_changed" } },
+                { "key": "session.id", "value": { "stringValue": "smoke-session-001" } },
+                { "key": "from_mode",  "value": { "stringValue": "auto" } },
+                { "key": "to_mode",    "value": { "stringValue": "default" } },
+                { "key": "trigger",    "value": { "stringValue": "auto_gate_denied" } }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

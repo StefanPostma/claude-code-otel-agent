@@ -1,0 +1,38 @@
+# Smoke-test overlay: merged ON TOP of processor/claude-code-agent.yaml via a second
+# --config flag. Swaps the Dynatrace exporter for the detailed debug exporter so the
+# enriched output can be inspected locally, and speeds up host_metrics scraping.
+# Nothing is sent to Dynatrace.
+#
+#   otelcol-contrib --config processor/claude-code-agent.yaml --config test/smoke-override.yaml
+exporters:
+  debug:
+    verbosity: detailed
+
+receivers:
+  # Own ports: the always-on auto-monitoring collector holds 4317/4318/18888. Without
+  # this, the test collector fails to bind and the readiness probe silently hits the LIVE
+  # collector — the sample then ends up in Dynatrace and every assertion fails.
+  otlp:
+    protocols:
+      grpc: { endpoint: 127.0.0.1:14317 }
+      http: { endpoint: 127.0.0.1:14318 }
+  host_metrics:
+    collection_interval: 5s
+
+service:
+  telemetry:
+    metrics:
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: 127.0.0.1
+                port: 28888
+
+  pipelines:
+    traces:
+      exporters: [debug, signal_to_metrics, count]
+    metrics:
+      exporters: [debug]
+    logs:
+      exporters: [debug, signal_to_metrics, count]

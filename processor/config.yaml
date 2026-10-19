@@ -1,0 +1,257 @@
+# ============================================================================
+#  "OneAgent" — GenAI gap-filling OTel Collector processor
+# ============================================================================
+#  A provider-agnostic downstream stage that fills the signals left uncovered
+#  by (a) the OTel GenAI semantic conventions and (b) the Claude Code mappings
+#  in dynatrace-oss/dynatrace-ai-agent-instrumentation-examples PR #353.
+#
+#  Unlike PR #353's collector/config.yaml (which maps claude_code.* → gen_ai.*),
+#  this config operates on the ALREADY-NORMALISED gen_ai.* namespace, so it is a
+#  drop-in stage for ANY GenAI source: Dynatrace OneAgent OTLP export, an OTel
+#  GenAI SDK, or the output of the PR #353 config. Chain it AFTER PR #353 for
+#  Claude Code, or point OneAgent/any SDK straight at it.
+#
+#  Gaps filled (see ../research/gap-analysis.md):
+#    G1 cost            → gen_ai.usage.cost on spans + gen_ai.client.cost metric
+#    G2 operation.kind  → gen_ai.operation.name (OneAgent 'kind' → spec 'name')
+#    G3 roll-up timing  → gen_ai.{invoke_agent,execute_tool,invoke_workflow}.duration
+#    G4 call counts     → gen_ai.agent.tool_calls (count connector; see caveat)
+#    G5 cache tokens    → gen_ai.usage.cache_{read,write}.input_tokens normalised
+#    G6 guardrails      → gen_ai.guardrail.* (TEMPLATE — confirm source keys)
+#    G7 totals/errors   → gen_ai.usage.total_tokens + error.type, provider-agnostic
+#    G8 server timing   → NOT filled: needs streaming timestamps (documented TODO)
+#
+#  Requires the CONTRIB distribution (transform, signal_to_metrics, count):
+#    otelcol-contrib --config config.yaml
+#  Validate without sending data:
+#    otelcol-contrib validate --config config.yaml
+#  Env: DT_ENDPOINT=https://<env>.live.dynatrace.com   DT_API_TOKEN=dt0c01....
+#       (token scope: openTelemetryTrace.ingest, metrics.ingest, logs.ingest)
+# ============================================================================
+
+receivers:
+  otlp:
+    protocols:
+      grpc: { endpoint: 0.0.0.0:4317 }
+      http: { endpoint: 0.0.0.0:4318 }
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 80
+    spike_limit_percentage: 20
+  batch: {}
+
+  # ---------------------------------------------------------------------------
+  # G2 + G5 + G7 — normalise any GenAI source onto the current spec's gen_ai.*
+  # ---------------------------------------------------------------------------
+  transform/genai_normalize:
+    error_mode: ignore
+    trace_statements:
+      - context: span
+        statements:
+          # provider: OneAgent 'gen_ai.provider' → spec 'gen_ai.provider.name'/'gen_ai.system'
+          - set(attributes["gen_ai.provider.name"], attributes["gen_ai.provider"]) where attributes["gen_ai.provider.name"] == nil and attributes["gen_ai.provider"] != nil
+          - set(attributes["gen_ai.system"], attributes["gen_ai.provider.name"]) where attributes["gen_ai.system"] == nil and attributes["gen_ai.provider.name"] != nil
+          # model: OneAgent 'gen_ai.model' → spec request/response model
+          - set(attributes["gen_ai.request.model"], attributes["gen_ai.model"]) where attributes["gen_ai.request.model"] == nil and attributes["gen_ai.model"] != nil
+
+          # G2 operation.kind → operation.name (only the three with exact spec
+          # counterparts; 'task' and 'retrieval' have no spec operation.name, so
+          # we leave gen_ai.operation.kind intact for them rather than invent one).
+          - set(attributes["gen_ai.operation.name"], "invoke_workflow") where attributes["gen_ai.operation.name"] == nil and attributes["gen_ai.operation.kind"] == "workflow"
+          - set(attributes["gen_ai.operation.name"], "invoke_agent")    where attributes["gen_ai.operation.name"] == nil and attributes["gen_ai.operation.kind"] == "agent"
+          - set(attributes["gen_ai.operation.name"], "execute_tool")    where attributes["gen_ai.operation.name"] == nil and attributes["gen_ai.operation.kind"] == "tool"
+
+          # G5 cache tokens → spec keys (handles both raw claude_code and OneAgent spellings)
+          - set(attributes["gen_ai.usage.cache_read.input_tokens"], Int(attributes["cache_read_tokens"])) where attributes["gen_ai.usage.cache_read.input_tokens"] == nil and attributes["cache_read_tokens"] != nil
+          - set(attributes["gen_ai.usage.cache_write.input_tokens"], Int(attributes["cache_creation_tokens"])) where attributes["gen_ai.usage.cache_write.input_tokens"] == nil and attributes["cache_creation_tokens"] != nil
+
+          # G7 total_tokens coalesce (only when absent; a missing side is not summed)
+          - set(attributes["gen_ai.usage.total_tokens"], Int(attributes["gen_ai.usage.input_tokens"]) + Int(attributes["gen_ai.usage.output_tokens"])) where attributes["gen_ai.usage.total_tokens"] == nil and attributes["gen_ai.usage.input_tokens"] != nil and attributes["gen_ai.usage.output_tokens"] != nil
+          # G7 error.type: prefer explicit class, else mark failed spans _OTHER (spec convention)
+          - set(attributes["error.type"], attributes["error_class"]) where attributes["error.type"] == nil and attributes["error_class"] != nil
+          - set(attributes["error.type"], "_OTHER") where attributes["error.type"] == nil and status.code == STATUS_CODE_ERROR
+    log_statements:
+      - context: log
+        statements:
+          - set(attributes["gen_ai.provider.name"], attributes["gen_ai.provider"]) where attributes["gen_ai.provider.name"] == nil and attributes["gen_ai.provider"] != nil
+          - set(attributes["gen_ai.request.model"], attributes["gen_ai.model"]) where attributes["gen_ai.request.model"] == nil and attributes["gen_ai.model"] != nil
+
+  # ---------------------------------------------------------------------------
+  # G1 — cost. OTel defines NO cost metric; the AI Observability "Overall cost"
+  # tile needs one. Compute gen_ai.usage.cost (USD) from tokens × an editable
+  # per-1M-token rate card. Runs AFTER normalize so gen_ai.request.model is set.
+  # Edit the rates in ./rate-card.md; keep the two in sync.
+  # ---------------------------------------------------------------------------
+  transform/genai_cost:
+    error_mode: ignore
+    trace_statements:
+      - context: span
+        conditions:
+          - attributes["gen_ai.usage.input_tokens"] != nil or attributes["gen_ai.usage.output_tokens"] != nil
+        statements:
+          # default tier: Claude Sonnet (USD / 1M tokens)
+          - set(attributes["tmp.rate.in"], 3.0)
+          - set(attributes["tmp.rate.out"], 15.0)
+          - set(attributes["tmp.rate.cr"], 0.30)
+          - set(attributes["tmp.rate.cw"], 3.75)
+          # Opus override
+          - set(attributes["tmp.rate.in"], 15.0)  where IsMatch(attributes["gen_ai.request.model"], "(?i).*opus.*")
+          - set(attributes["tmp.rate.out"], 75.0) where IsMatch(attributes["gen_ai.request.model"], "(?i).*opus.*")
+          - set(attributes["tmp.rate.cr"], 1.50)  where IsMatch(attributes["gen_ai.request.model"], "(?i).*opus.*")
+          - set(attributes["tmp.rate.cw"], 18.75) where IsMatch(attributes["gen_ai.request.model"], "(?i).*opus.*")
+          # Haiku override
+          - set(attributes["tmp.rate.in"], 0.80) where IsMatch(attributes["gen_ai.request.model"], "(?i).*haiku.*")
+          - set(attributes["tmp.rate.out"], 4.0) where IsMatch(attributes["gen_ai.request.model"], "(?i).*haiku.*")
+          - set(attributes["tmp.rate.cr"], 0.08) where IsMatch(attributes["gen_ai.request.model"], "(?i).*haiku.*")
+          - set(attributes["tmp.rate.cw"], 1.0)  where IsMatch(attributes["gen_ai.request.model"], "(?i).*haiku.*")
+          # accumulate: each term guarded on its own token attribute
+          - set(attributes["tmp.cost"], 0.0)
+          - set(attributes["tmp.cost"], Double(attributes["tmp.cost"]) + Double(attributes["gen_ai.usage.input_tokens"]) / 1000000.0 * Double(attributes["tmp.rate.in"])) where attributes["gen_ai.usage.input_tokens"] != nil
+          - set(attributes["tmp.cost"], Double(attributes["tmp.cost"]) + Double(attributes["gen_ai.usage.output_tokens"]) / 1000000.0 * Double(attributes["tmp.rate.out"])) where attributes["gen_ai.usage.output_tokens"] != nil
+          - set(attributes["tmp.cost"], Double(attributes["tmp.cost"]) + Double(attributes["gen_ai.usage.cache_read.input_tokens"]) / 1000000.0 * Double(attributes["tmp.rate.cr"])) where attributes["gen_ai.usage.cache_read.input_tokens"] != nil
+          - set(attributes["tmp.cost"], Double(attributes["tmp.cost"]) + Double(attributes["gen_ai.usage.cache_write.input_tokens"]) / 1000000.0 * Double(attributes["tmp.rate.cw"])) where attributes["gen_ai.usage.cache_write.input_tokens"] != nil
+          - set(attributes["gen_ai.usage.cost"], attributes["tmp.cost"])
+          - delete_matching_keys(attributes, "^tmp\\.")
+
+  # ---------------------------------------------------------------------------
+  # G6 — guardrails. OneAgent captures Bedrock guardrail activations/filter hits;
+  # OTel has no convention. This is a TEMPLATE: confirm the real source attribute
+  # keys against your OneAgent export (DQL: fetch spans | filter isNotNull(...))
+  # and adjust the right-hand sides. It sets gen_ai.guardrail.triggered=true so
+  # the count connector below can produce an activation counter.
+  # ---------------------------------------------------------------------------
+  transform/genai_guardrail:
+    error_mode: ignore
+    trace_statements:
+      - context: span
+        conditions:
+          - attributes["aws.bedrock.guardrail.id"] != nil or attributes["gen_ai.guardrail.id"] != nil
+        statements:
+          - set(attributes["gen_ai.guardrail.id"], attributes["aws.bedrock.guardrail.id"]) where attributes["gen_ai.guardrail.id"] == nil and attributes["aws.bedrock.guardrail.id"] != nil
+          - set(attributes["gen_ai.guardrail.action"], attributes["aws.bedrock.guardrail.action"]) where attributes["gen_ai.guardrail.action"] == nil and attributes["aws.bedrock.guardrail.action"] != nil
+          # direction ∈ {input, output}; filter.type ∈ {pii, topic, word, content}
+          - set(attributes["gen_ai.guardrail.direction"], attributes["aws.bedrock.guardrail.direction"]) where attributes["gen_ai.guardrail.direction"] == nil and attributes["aws.bedrock.guardrail.direction"] != nil
+          - set(attributes["gen_ai.guardrail.filter.type"], attributes["aws.bedrock.guardrail.filter"]) where attributes["gen_ai.guardrail.filter.type"] == nil and attributes["aws.bedrock.guardrail.filter"] != nil
+          - set(attributes["gen_ai.guardrail.triggered"], true)
+
+connectors:
+  # G1 cost metric + G3 roll-up duration histograms, derived from enriched spans.
+  # Must sit AFTER the transform processors in the traces pipeline.
+  signal_to_metrics:
+    spans:
+      # --- G1: cost (USD). NOT an OTel-spec metric — a vendor extension that
+      #         fills the gap, mirroring how PR #353 extends token conventions. ---
+      - name: gen_ai.client.cost
+        description: Estimated GenAI operation cost in USD (tokens × rate card).
+        unit: "{USD}"
+        conditions:
+          - span.attributes["gen_ai.usage.cost"] != nil
+        attributes:
+          - key: gen_ai.request.model
+            optional: true
+          - key: gen_ai.provider.name
+          - key: gen_ai.operation.name
+            optional: true
+        sum:
+          value: Double(span.attributes["gen_ai.usage.cost"])
+          monotonic: true
+
+      # --- G3: invoke_agent.duration (seconds) ---
+      - name: gen_ai.invoke_agent.duration
+        description: Duration of a single agent invocation.
+        unit: s
+        conditions:
+          - span.attributes["gen_ai.operation.name"] == "invoke_agent"
+        attributes:
+          - key: gen_ai.provider.name
+          - key: gen_ai.agent.name
+            optional: true
+          - key: error.type
+            optional: true
+        histogram:
+          buckets: [0.01, 0.05, 0.1, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300]
+          value: Seconds(span.end_time - span.start_time)
+
+      # --- G3: execute_tool.duration (seconds) ---
+      - name: gen_ai.execute_tool.duration
+        description: Duration of a single tool execution.
+        unit: s
+        conditions:
+          - span.attributes["gen_ai.operation.name"] == "execute_tool"
+        attributes:
+          - key: gen_ai.provider.name
+          - key: gen_ai.tool.name
+            optional: true
+          - key: error.type
+            optional: true
+        histogram:
+          buckets: [0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5, 10, 30, 60]
+          value: Seconds(span.end_time - span.start_time)
+
+      # --- G3: invoke_workflow.duration (seconds) ---
+      - name: gen_ai.invoke_workflow.duration
+        description: End-to-end duration of a workflow execution.
+        unit: s
+        conditions:
+          - span.attributes["gen_ai.operation.name"] == "invoke_workflow"
+        attributes:
+          - key: gen_ai.provider.name
+          - key: gen_ai.workflow.name
+            optional: true
+        histogram:
+          buckets: [0.1, 0.5, 1, 5, 10, 30, 60, 120, 300, 600]
+          value: Seconds(span.end_time - span.start_time)
+
+  # G4 + G6 — counters the spec defines as per-invocation histograms but which a
+  # stateless connector cannot aggregate across child spans. We approximate:
+  #   gen_ai.agent.tool_calls   = count of execute_tool spans, by conversation
+  #   gen_ai.guardrail.activations = count of triggered guardrail spans
+  # CAVEAT: these are cumulative COUNTERS grouped by conversation.id, NOT the
+  # spec's invoke_agent.tool_calls histogram (calls-per-invocation). Rate/agg in
+  # DQL per conversation to recover per-invocation figures.
+  count:
+    spans:
+      gen_ai.agent.tool_calls:
+        description: Tool executions, counted by conversation (G4 approximation).
+        conditions:
+          - attributes["gen_ai.operation.name"] == "execute_tool"
+        attributes:
+          - key: gen_ai.conversation.id
+          - key: gen_ai.provider.name
+          - key: gen_ai.tool.name
+            default_value: unknown
+      gen_ai.guardrail.activations:
+        description: Guardrail activations (G6).
+        conditions:
+          - attributes["gen_ai.guardrail.triggered"] == true
+        attributes:
+          - key: gen_ai.provider.name
+          - key: gen_ai.guardrail.direction
+            default_value: unknown
+          - key: gen_ai.guardrail.filter.type
+            default_value: unknown
+
+exporters:
+  otlp_http/dynatrace:
+    endpoint: ${env:DT_ENDPOINT}/api/v2/otlp
+    headers:
+      Authorization: "Api-Token ${env:DT_API_TOKEN}"
+  debug:
+    verbosity: normal
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, transform/genai_normalize, transform/genai_cost, transform/genai_guardrail, batch]
+      exporters: [otlp_http/dynatrace, signal_to_metrics, count]
+    metrics:
+      receivers: [otlp, signal_to_metrics, count]
+      processors: [memory_limiter, batch]
+      exporters: [otlp_http/dynatrace]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, transform/genai_normalize, batch]
+      exporters: [otlp_http/dynatrace]

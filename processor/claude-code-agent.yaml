@@ -1,0 +1,616 @@
+# ============================================================================
+#  Claude Code observability agent — "OneAgent-grade" monitoring over OTel
+# ============================================================================
+#  A self-contained OTel Collector (contrib) config that receives Claude Code's
+#  native OTLP stream and enriches it to the agentic-AI coverage OneAgent gives
+#  — the signals the raw stream lacks (verified live on the test tenant): cache tokens, cost, and derived GenAI metrics,
+#  plus an EVENTS layer over the Claude Code log stream (authoritative cost, TTFT,
+#  turns, tool outcomes, bash-command classes, permission friction, compactions —
+#  the session analytics Datadog's AI Agents Console shows; research/datadog-comparison.md).
+#
+#  This is the Claude-Code-SCOPED sibling of ./config.yaml (the provider-agnostic
+#  gap filler). Guardrails and operation.kind translation are intentionally absent
+#  — the CC stream has neither.
+#
+#  Run:   otelcol-contrib --config claude-code-agent.yaml
+#  Then start a monitored Claude Code session: see ../start-monitored-session.md
+#  Env:   DT_ENDPOINT=https://<env>.live.dynatrace.com   DT_API_TOKEN=dt0c01....
+# ============================================================================
+
+receivers:
+  otlp:
+    protocols:
+      grpc: { endpoint: 0.0.0.0:4317 }
+      http: { endpoint: 0.0.0.0:4318 }
+
+  # HOST METRICS — only when OneAgent is NOT on this host. Gives Dynatrace the
+  # infra layer (CPU/mem/disk/net/process) a OneAgent would report, bound to the
+  # same host entity via the host-identity processors below.
+  # ⚠ If OneAgent IS installed here, DELETE this receiver (and drop it from the
+  #   metrics pipeline) — otherwise host metrics are double-reported.
+  # ⚠ Windows: remove the `processes` scraper (Linux/macOS only). The `process`
+  #   scraper needs elevated privileges; mute_process_all_errors tolerates gaps.
+  # Container (Linux only): mount the host fs and add `root_path: /hostfs` here —
+  # root_path is rejected on macOS/Windows, so it is deliberately not set by default.
+  host_metrics:
+    collection_interval: 30s
+    scrapers:
+      cpu:
+        metrics:
+          system.cpu.utilization: { enabled: true }
+      load: {}
+      memory:
+        metrics:
+          system.memory.utilization: { enabled: true }
+      disk: {}
+      filesystem:
+        include_virtual_filesystems: false
+        metrics:
+          system.filesystem.utilization: { enabled: true }
+      network: {}
+      paging: {}
+      processes: {}            # system-wide process counts (not on Windows)
+      system: {}               # system.uptime
+      process:                 # per-process CPU/memory — OneAgent-like, needs privileges
+        mute_process_all_errors: true
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 80
+    spike_limit_percentage: 20
+  batch: {}
+
+  # ENTITY BRIDGE — the link OTel lacks (see ../research/host-entity-model.md).
+  # The `dynatrace` detector reads OneAgent's enrichment file
+  # (/var/lib/dynatrace/enrichment/dt_host_metadata.properties) and stamps
+  # dt.entity.host / host.name / dt.smartscape.host, so Claude Code's spans attach
+  # to the real Smartscape HOST entity and its process topology (runs_on / belongs_to).
+  # The `dynatrace` detector is included in stock otelcol-contrib (verified: 0.163.1).
+  # `system` is the fallback where OneAgent isn't installed: OTel host.name/host.id let
+  # Dynatrace's OTel-native entity model build a (shallower) host entity.
+  resource_detection/dynatrace:
+    detectors: [dynatrace, system]
+    override: false
+    timeout: 2s
+    system:
+      # OneAgent's `dynatrace` detector owns host identity when present. The system
+      # detector contributes only OS/hardware facts — host.id/host.name come from the
+      # stable fallback below (resource/host_identity), so identity stays consistent and
+      # cross-platform instead of varying with the system detector's per-OS source.
+      # The extra facts mirror Dynatrace's reference host-metrics.yaml so the
+      # OpenTelemetry Host Monitoring extension can populate the otel:host entity.
+      resource_attributes:
+        host.id: { enabled: false }
+        host.name: { enabled: false }
+        host.arch: { enabled: true }
+        host.ip: { enabled: true }
+        host.mac: { enabled: true }
+        host.cpu.model.name: { enabled: true }
+        os.type: { enabled: true }
+        os.description: { enabled: true }
+        os.name: { enabled: true }
+        os.version: { enabled: true }
+        os.build.id: { enabled: true }
+
+  # STABLE host.id FALLBACK — applied only when neither OneAgent nor an upstream
+  # source already set these (action: insert never overrides). Values come from
+  # host-identity/compute-host-id.sh (Linux/macOS) or Compute-HostId.ps1 (Windows),
+  # exported by start-collector.{sh,ps1}. Gives a OneAgent-less host a persistent
+  # entity. See ../research/host-entity-model.md §5.
+  resource/host_identity:
+    attributes:
+      - { key: host.id,   value: "${env:STABLE_HOST_ID}",   action: insert }
+      - { key: host.name, value: "${env:STABLE_HOST_NAME}", action: insert }
+      # Claude Code's spans reach Grail WITHOUT telemetry.sdk.name, and the OpenTelemetry
+      # Host Monitoring extension links spans to OTEL_HOST only when
+      # telemetry.sdk.name ∈ {opentelemetry, odin, otel} (logs use dt.openpipeline.source
+      # instead, so they linked fine). insert = only when absent — verified live 2026-10-19.
+      - { key: telemetry.sdk.name, value: opentelemetry, action: insert }
+
+  # HOST METRICS SHAPING — aligned with Dynatrace's reference host-metrics.yaml
+  # (github.com/Dynatrace/dynatrace-otel-collector config_examples) so the
+  # OpenTelemetry Host Monitoring extension gets what it expects.
+  #
+  # 1) Dynatrace does NOT ingest cumulative counters: without this, system.cpu.time,
+  #    system.network.io, system.disk.io, system.paging.operations, process.cpu.time …
+  #    were silently dropped (verified on the test tenant: only gauges arrived). Scoped to the
+  #    host_metrics names — Claude Code already exports delta, connectors emit delta.
+  cumulative_to_delta/host_metrics:
+    max_staleness: 25h
+    include:
+      metrics: ["^system\\..*", "^process\\..*"]
+      match_type: regexp
+  # 2) Drop the cpu "idle" state (the reference does; it is 1-utilization).
+  filter/host_metrics:
+    metrics:
+      datapoint:
+        - metric.name == "system.cpu.utilization" and attributes["state"] == "idle"
+  # 3) Tame process.* cardinality: the per-process resource carries pid/command_line/
+  #    args/owner, which made 936 series per process metric on the first live run.
+  #    Keep process.executable.name (+ host.*) as the identity, as the reference does.
+  #    host.ip arrives as a list — Dynatrace wants a scalar.
+  transform/host_metrics:
+    error_mode: ignore
+    metric_statements:
+      - context: resource
+        statements:
+          - set(resource.attributes["host.ip"], resource.attributes["host.ip"][0]) where resource.attributes["host.ip"] != nil
+      - context: datapoint
+        statements:
+          - delete_key(resource.attributes, "process.pid") where IsMatch(metric.name, "^process\\..*")
+          - delete_key(resource.attributes, "process.parent_pid") where IsMatch(metric.name, "^process\\..*")
+          - delete_key(resource.attributes, "process.command") where IsMatch(metric.name, "^process\\..*")
+          - delete_key(resource.attributes, "process.command_line") where IsMatch(metric.name, "^process\\..*")
+          - delete_key(resource.attributes, "process.command_args") where IsMatch(metric.name, "^process\\..*")
+          - delete_key(resource.attributes, "process.executable.path") where IsMatch(metric.name, "^process\\..*")
+          - delete_key(resource.attributes, "process.owner") where IsMatch(metric.name, "^process\\..*")
+          - delete_key(resource.attributes, "process.cgroup") where IsMatch(metric.name, "^process\\..*")
+          - delete_key(attributes, "device") where attributes["device"] == ""
+          - delete_key(attributes, "protocol") where IsMatch(metric.name, "^system\\.network\\..*")
+          - delete_key(attributes, "device") where IsMatch(metric.name, "^system\\.filesystem\\..*")
+          - delete_key(attributes, "mode") where IsMatch(metric.name, "^system\\.filesystem\\..*")
+          - delete_key(attributes, "type") where IsMatch(metric.name, "^system\\.filesystem\\..*")
+
+  # R1 + R2 + R3 — enrich claude_code.llm_request spans
+  transform/cc_enrich:
+    error_mode: ignore
+    trace_statements:
+      - context: span
+        conditions:
+          - name == "claude_code.llm_request"
+        statements:
+          - set(attributes["gen_ai.request.model"], attributes["model"]) where attributes["gen_ai.request.model"] == nil and attributes["model"] != nil
+          # R1: cache tokens the raw stream carries but never maps to gen_ai.*
+          - set(attributes["gen_ai.usage.cache_read.input_tokens"], Int(attributes["cache_read_tokens"])) where attributes["cache_read_tokens"] != nil
+          - set(attributes["gen_ai.usage.cache_write.input_tokens"], Int(attributes["cache_creation_tokens"])) where attributes["cache_creation_tokens"] != nil
+          # spec total (input + output only)
+          - set(attributes["gen_ai.usage.total_tokens"], Int(attributes["input_tokens"]) + Int(attributes["output_tokens"])) where attributes["input_tokens"] != nil and attributes["output_tokens"] != nil
+          # R2: honest input — the "2" in input_tokens excludes the cached context
+          - set(attributes["dt.genai.effective_input_tokens"], Int(attributes["input_tokens"]) + Int(attributes["cache_read_tokens"]) + Int(attributes["cache_creation_tokens"])) where attributes["input_tokens"] != nil and attributes["cache_read_tokens"] != nil and attributes["cache_creation_tokens"] != nil
+          - set(attributes["error.type"], attributes["error_class"]) where attributes["error.type"] == nil and attributes["error_class"] != nil
+          - set(attributes["error.type"], "_OTHER") where attributes["error.type"] == nil and status.code == STATUS_CODE_ERROR
+
+          # §2 cache efficiency + §3 decode throughput (see research/metrics-proposal.md)
+          - set(attributes["dt.genai.cache_read_ratio"], Double(attributes["cache_read_tokens"]) / (Double(attributes["input_tokens"]) + Double(attributes["cache_read_tokens"]) + Double(attributes["cache_creation_tokens"]))) where attributes["cache_read_tokens"] != nil and attributes["input_tokens"] != nil and attributes["cache_creation_tokens"] != nil
+          - set(attributes["dt.genai.output_tokens_per_second"], Double(attributes["output_tokens"]) / (Double(attributes["duration_ms"]) / 1000.0)) where attributes["output_tokens"] != nil and attributes["duration_ms"] != nil and Double(attributes["duration_ms"]) > 0
+
+          # R3: cost (USD). Rates per 1M tokens — keep in sync with ./rate-card.md.
+          - set(attributes["tmp.in"], 3.0)
+          - set(attributes["tmp.out"], 15.0)
+          - set(attributes["tmp.cr"], 0.30)
+          - set(attributes["tmp.cw"], 3.75)
+          - set(attributes["tmp.in"], 15.0)  where IsMatch(attributes["model"], "(?i).*opus.*")
+          - set(attributes["tmp.out"], 75.0) where IsMatch(attributes["model"], "(?i).*opus.*")
+          - set(attributes["tmp.cr"], 1.50)  where IsMatch(attributes["model"], "(?i).*opus.*")
+          - set(attributes["tmp.cw"], 18.75) where IsMatch(attributes["model"], "(?i).*opus.*")
+          - set(attributes["tmp.in"], 0.80) where IsMatch(attributes["model"], "(?i).*haiku.*")
+          - set(attributes["tmp.out"], 4.0) where IsMatch(attributes["model"], "(?i).*haiku.*")
+          - set(attributes["tmp.cr"], 0.08) where IsMatch(attributes["model"], "(?i).*haiku.*")
+          - set(attributes["tmp.cw"], 1.0)  where IsMatch(attributes["model"], "(?i).*haiku.*")
+          - set(attributes["tmp.cost"], 0.0)
+          - set(attributes["tmp.cost"], Double(attributes["tmp.cost"]) + Double(attributes["input_tokens"]) / 1000000.0 * Double(attributes["tmp.in"])) where attributes["input_tokens"] != nil
+          - set(attributes["tmp.cost"], Double(attributes["tmp.cost"]) + Double(attributes["output_tokens"]) / 1000000.0 * Double(attributes["tmp.out"])) where attributes["output_tokens"] != nil
+          - set(attributes["tmp.cost"], Double(attributes["tmp.cost"]) + Double(attributes["cache_read_tokens"]) / 1000000.0 * Double(attributes["tmp.cr"])) where attributes["cache_read_tokens"] != nil
+          - set(attributes["tmp.cost"], Double(attributes["tmp.cost"]) + Double(attributes["cache_creation_tokens"]) / 1000000.0 * Double(attributes["tmp.cw"])) where attributes["cache_creation_tokens"] != nil
+          # ESTIMATE only. The authoritative per-request cost is Claude Code's own
+          # `cost_usd` on the api_request LOG event (see transform/cc_events) — a flat
+          # rate card cannot reproduce long-context pricing tiers (fit error up to 55%
+          # on fable-5-1, see ./rate-card.md). Kept on the span for trace-view context.
+          - set(attributes["gen_ai.usage.cost"], attributes["tmp.cost"])
+          - set(attributes["dt.genai.cost.source"], "rate_card_estimate")
+          - delete_matching_keys(attributes, "^tmp\\.")
+
+  # EVENTS LAYER — the Claude Code log stream (events: api_request, tool_result,
+  # tool_decision, user_prompt, api_error, compaction, subagent_completed, hooks…).
+  # This is where the session-analytics signals live that Datadog's AI Agents Console
+  # renders (turns/session, retry loops, file rereads, skipped checks, spend per
+  # user) and that neither the span stream nor Grafana 25052 can give.
+  # Verified live on the test tenant 2026-10-18 (research/datadog-comparison.md §3).
+  transform/cc_events:
+    error_mode: ignore
+    log_statements:
+      # ---- every Claude Code event ------------------------------------------
+      - context: log
+        conditions:
+          - attributes["event.name"] != nil and attributes["session.id"] != nil
+        statements:
+          # join key with the span stream (spans carry gen_ai.conversation.id = session.id)
+          - set(attributes["gen_ai.conversation.id"], attributes["session.id"]) where attributes["gen_ai.conversation.id"] == nil
+          - set(attributes["gen_ai.provider.name"], "anthropic") where attributes["gen_ai.provider.name"] == nil
+          # Claude Code emits every event at severity 0 / "INFO" — give failures a real level
+          - set(severity_number, SEVERITY_NUMBER_ERROR) where attributes["event.name"] == "api_error" or attributes["event.name"] == "internal_error" or (attributes["event.name"] == "tool_result" and attributes["success"] == "false")
+          - set(severity_text, "ERROR") where severity_number == SEVERITY_NUMBER_ERROR
+          - set(severity_number, SEVERITY_NUMBER_WARN) where attributes["event.name"] == "api_refusal" or (attributes["event.name"] == "tool_decision" and attributes["decision"] == "reject")
+          - set(severity_text, "WARN") where severity_number == SEVERITY_NUMBER_WARN
+
+      # ---- api_request: AUTHORITATIVE cost + server timing -------------------
+      - context: log
+        conditions:
+          - attributes["event.name"] == "api_request"
+        statements:
+          - set(attributes["gen_ai.request.model"], attributes["model"]) where attributes["model"] != nil
+          - set(attributes["gen_ai.usage.cost"], Double(attributes["cost_usd"])) where attributes["cost_usd"] != nil
+          - set(attributes["dt.genai.cost.source"], "claude_code") where attributes["cost_usd"] != nil
+          - set(attributes["gen_ai.usage.input_tokens"], Int(attributes["input_tokens"])) where attributes["input_tokens"] != nil
+          - set(attributes["gen_ai.usage.output_tokens"], Int(attributes["output_tokens"])) where attributes["output_tokens"] != nil
+          - set(attributes["gen_ai.usage.cache_read.input_tokens"], Int(attributes["cache_read_tokens"])) where attributes["cache_read_tokens"] != nil
+          - set(attributes["gen_ai.usage.cache_write.input_tokens"], Int(attributes["cache_creation_tokens"])) where attributes["cache_creation_tokens"] != nil
+          # G8 closed: time-to-first-token IS exported — on the log event, not the span
+          - set(attributes["gen_ai.server.time_to_first_token"], Double(attributes["ttft_ms"]) / 1000.0) where attributes["ttft_ms"] != nil
+          # Who spent it: main thread vs subagent vs auxiliary (title generation, classifiers…)
+          - set(attributes["cc.query_source.class"], "auxiliary")
+          - set(attributes["cc.query_source.class"], "main") where attributes["query_source"] == "repl_main_thread"
+          - set(attributes["cc.query_source.class"], "subagent") where IsMatch(attributes["query_source"], "^agent") or attributes["agent.name"] != nil
+          - set(attributes["cc.query_source.class"], "compact") where attributes["query_source"] == "compact"
+
+      # ---- tool_result: what the agent did, and whether it worked -------------
+      - context: log
+        conditions:
+          - attributes["event.name"] == "tool_result"
+        statements:
+          - set(attributes["gen_ai.tool.name"], attributes["tool_name"]) where attributes["tool_name"] != nil
+          - set(attributes["gen_ai.tool.call.id"], attributes["tool_use_id"]) where attributes["tool_use_id"] != nil
+          # Stable fingerprint of the exact call → detects "same call repeated" (retry
+          # loops, file rereads) in DQL without exposing the input itself.
+          - set(attributes["cc.tool.input_hash"], SHA256(attributes["tool_input"])) where attributes["tool_input"] != nil
+          # tool_input is a JSON string (present with OTEL_LOG_TOOL_DETAILS=1)
+          - set(attributes["tmp.input"], ParseJSON(attributes["tool_input"])) where attributes["tool_input"] != nil and IsMatch(attributes["tool_input"], "^\\s*\\{")
+          - set(attributes["cc.tool.file_path"], attributes["tmp.input"]["file_path"]) where attributes["tmp.input"]["file_path"] != nil
+          - set(attributes["cc.tool.file_path"], attributes["tmp.input"]["notebook_path"]) where attributes["cc.tool.file_path"] == nil and attributes["tmp.input"]["notebook_path"] != nil
+          - set(attributes["cc.tool.pattern"], attributes["tmp.input"]["pattern"]) where attributes["tmp.input"]["pattern"] != nil
+          - set(attributes["cc.tool.subagent_type"], attributes["tmp.input"]["subagent_type"]) where attributes["tmp.input"]["subagent_type"] != nil
+          - set(attributes["cc.tool.skill"], attributes["tmp.input"]["skill"]) where attributes["tmp.input"]["skill"] != nil
+          # Bash command classification — the "skipped checks" signal: a vcs_commit
+          # in a session with no `test` class before it.
+          - set(attributes["tmp.cmd"], attributes["tmp.input"]["command"]) where attributes["tmp.input"]["command"] != nil
+          - set(attributes["cc.bash.class"], "other") where attributes["tmp.cmd"] != nil
+          - set(attributes["cc.bash.class"], "package_manager") where attributes["tmp.cmd"] != nil and IsMatch(attributes["tmp.cmd"], "(?i)\\b(npm|pnpm|yarn|bun)\\s+(i|install|add|ci)\\b|\\bpip3?\\s+install|\\bbrew\\s+install|\\bapt(-get)?\\s+install|\\bgo\\s+get\\b|\\bcargo\\s+add\\b")
+          - set(attributes["cc.bash.class"], "build") where attributes["tmp.cmd"] != nil and IsMatch(attributes["tmp.cmd"], "(?i)\\b(npm|pnpm|yarn|bun)\\s+(run\\s+)?build\\b|\\bgo\\s+build\\b|\\bcargo\\s+build\\b|\\bmake\\b|\\btsc\\b|\\bmvn\\b.*\\b(package|compile)\\b|\\bgradle\\w*\\b.*\\bbuild\\b")
+          - set(attributes["cc.bash.class"], "lint") where attributes["tmp.cmd"] != nil and IsMatch(attributes["tmp.cmd"], "(?i)\\b(eslint|ruff|flake8|pylint|golangci-lint|cargo\\s+clippy|prettier|black|mypy|tsc\\s+--noEmit)\\b|\\b(npm|pnpm|yarn|bun)\\s+(run\\s+)?(lint|typecheck|format)\\b")
+          - set(attributes["cc.bash.class"], "test") where attributes["tmp.cmd"] != nil and IsMatch(attributes["tmp.cmd"], "(?i)\\b(npm|pnpm|yarn|bun)\\s+(run\\s+)?test\\b|\\bpytest\\b|\\bgo\\s+test\\b|\\bcargo\\s+test\\b|\\b(jest|vitest|mocha|playwright\\s+test)\\b|\\bmvn\\b.*\\btest\\b|\\bgradle\\w*\\b.*\\btest\\b|\\bsmoke-test\\b|\\bctest\\b")
+          - set(attributes["cc.bash.class"], "vcs_other") where attributes["tmp.cmd"] != nil and IsMatch(attributes["tmp.cmd"], "(?i)\\bgit\\b")
+          - set(attributes["cc.bash.class"], "vcs_commit") where attributes["tmp.cmd"] != nil and IsMatch(attributes["tmp.cmd"], "(?i)\\bgit\\s+commit\\b")
+          - set(attributes["cc.bash.class"], "vcs_push") where attributes["tmp.cmd"] != nil and IsMatch(attributes["tmp.cmd"], "(?i)\\bgit\\s+push\\b")
+          - set(attributes["cc.bash.class"], "vcs_pr") where attributes["tmp.cmd"] != nil and IsMatch(attributes["tmp.cmd"], "(?i)\\bgh\\s+pr\\s+create\\b|\\bglab\\s+mr\\s+create\\b")
+          - delete_matching_keys(attributes, "^tmp\\.")
+
+      # ---- hooks: did a hook block the agent? ---------------------------------
+      - context: log
+        conditions:
+          - attributes["event.name"] == "hook_execution_complete"
+        statements:
+          - set(attributes["cc.hook.blocked"], "false")
+          - set(attributes["cc.hook.blocked"], "true") where attributes["num_blocking"] != nil and Int(attributes["num_blocking"]) > 0
+
+      # ---- compaction: context reclaimed -------------------------------------
+      - context: log
+        conditions:
+          - attributes["event.name"] == "compaction"
+        statements:
+          - set(attributes["cc.compaction.tokens_reclaimed"], Int(attributes["pre_tokens"]) - Int(attributes["post_tokens"])) where attributes["pre_tokens"] != nil and attributes["post_tokens"] != nil
+
+connectors:
+  signal_to_metrics:
+    spans:
+      # R3: rate-card ESTIMATE from spans. The authoritative `gen_ai.client.cost`
+      # comes from the api_request log (logs: section below). Kept separately so the
+      # two never double-count and the estimate can be reconciled against the truth.
+      - name: dt.genai.cost.estimated
+        description: Rate-card cost estimate in USD derived from span token counts (compare with gen_ai.client.cost).
+        unit: "{USD}"
+        conditions:
+          - span.attributes["gen_ai.usage.cost"] != nil
+        attributes:
+          - { key: gen_ai.request.model, optional: true }
+          - { key: gen_ai.provider.name }
+          - { key: gen_ai.conversation.id, optional: true }   # §1 per-conversation cost — Grafana's #1 gap
+          - { key: stop_reason, optional: true }
+        sum:
+          value: Double(span.attributes["gen_ai.usage.cost"])
+          monotonic: true
+
+      # §3: decode throughput (output tokens/sec) — approximates the OTel
+      # server.time_per_output_token the raw stream never provides.
+      - name: gen_ai.throughput.output_tokens_per_second
+        description: Output token decode throughput.
+        unit: "{token}/s"
+        conditions:
+          - span.name == "claude_code.llm_request" and span.attributes["dt.genai.output_tokens_per_second"] != nil
+        attributes:
+          - { key: gen_ai.request.model, optional: true }
+        histogram:
+          buckets: [5, 10, 20, 40, 80, 160, 320, 640]
+          value: Double(span.attributes["dt.genai.output_tokens_per_second"])
+
+      # R4: token usage incl. cache, keyed by token type
+      - name: gen_ai.client.token.usage
+        description: Input tokens.
+        unit: "{token}"
+        conditions:
+          - span.name == "claude_code.llm_request" and span.attributes["input_tokens"] != nil
+        attributes:
+          - { key: gen_ai.token.type, default_value: input }
+          - { key: gen_ai.request.model, optional: true }
+          - { key: gen_ai.provider.name }
+        sum:
+          value: Int(span.attributes["input_tokens"])
+          monotonic: true
+      - name: gen_ai.client.token.usage
+        description: Output tokens.
+        unit: "{token}"
+        conditions:
+          - span.name == "claude_code.llm_request" and span.attributes["output_tokens"] != nil
+        attributes:
+          - { key: gen_ai.token.type, default_value: output }
+          - { key: gen_ai.request.model, optional: true }
+          - { key: gen_ai.provider.name }
+        sum:
+          value: Int(span.attributes["output_tokens"])
+          monotonic: true
+      - name: gen_ai.client.token.usage
+        description: Cache read tokens (most of the real volume).
+        unit: "{token}"
+        conditions:
+          - span.name == "claude_code.llm_request" and span.attributes["cache_read_tokens"] != nil
+        attributes:
+          - { key: gen_ai.token.type, default_value: cacheRead }
+          - { key: gen_ai.request.model, optional: true }
+          - { key: gen_ai.provider.name }
+        sum:
+          value: Int(span.attributes["cache_read_tokens"])
+          monotonic: true
+      - name: gen_ai.client.token.usage
+        description: Cache creation tokens.
+        unit: "{token}"
+        conditions:
+          - span.name == "claude_code.llm_request" and span.attributes["cache_creation_tokens"] != nil
+        attributes:
+          - { key: gen_ai.token.type, default_value: cacheCreation }
+          - { key: gen_ai.request.model, optional: true }
+          - { key: gen_ai.provider.name }
+        sum:
+          value: Int(span.attributes["cache_creation_tokens"])
+          monotonic: true
+
+      # R4: operation duration — from CC's explicit duration_ms (more precise than
+      # span end−start), converted to the spec's seconds.
+      - name: gen_ai.client.operation.duration
+        description: LLM operation duration.
+        unit: s
+        conditions:
+          - span.name == "claude_code.llm_request" and span.attributes["duration_ms"] != nil
+        attributes:
+          - { key: gen_ai.request.model, optional: true }
+          - { key: gen_ai.provider.name }
+          - { key: error.type, optional: true }
+        histogram:
+          buckets: [0.05, 0.1, 0.5, 1, 2.5, 5, 10, 30, 60, 120]
+          value: Double(span.attributes["duration_ms"]) / 1000.0
+      # R5: tool execution duration
+      - name: gen_ai.execute_tool.duration
+        description: Tool execution duration.
+        unit: s
+        conditions:
+          - span.name == "claude_code.tool" and span.attributes["duration_ms"] != nil
+        attributes:
+          - { key: gen_ai.tool.name, optional: true }
+          - { key: gen_ai.provider.name }
+        histogram:
+          buckets: [0.005, 0.01, 0.05, 0.1, 0.5, 1, 5, 10, 30, 60]
+          value: Double(span.attributes["duration_ms"]) / 1000.0
+
+    # ======================= LOG-DERIVED (events layer) =======================
+    logs:
+      # AUTHORITATIVE cost — Claude Code's own cost_usd per API request, including
+      # long-context tiers the rate card cannot model. Attributed per session, model,
+      # and who spent it (main / subagent / auxiliary / compact) + effort & speed.
+      - name: gen_ai.client.cost
+        description: Claude Code cost in USD per API request (authoritative, from cost_usd), attributed per session.
+        unit: "{USD}"
+        conditions:
+          - attributes["event.name"] == "api_request" and attributes["cost_usd"] != nil
+        attributes:
+          - { key: gen_ai.request.model, optional: true }
+          - { key: gen_ai.provider.name }
+          - { key: gen_ai.conversation.id, optional: true }
+          - { key: cc.query_source.class, optional: true }
+          - { key: effort, optional: true }
+          - { key: speed, optional: true }
+        sum:
+          value: Double(attributes["cost_usd"])
+          monotonic: true
+
+      # G8 closed — OTel's gen_ai.server.time_to_first_token, from ttft_ms.
+      - name: gen_ai.server.time_to_first_token
+        description: Time to first token of the model response.
+        unit: s
+        conditions:
+          - attributes["event.name"] == "api_request" and attributes["ttft_ms"] != nil
+        attributes:
+          - { key: gen_ai.request.model, optional: true }
+          - { key: cc.query_source.class, optional: true }
+          - { key: speed, optional: true }
+        histogram:
+          buckets: [0.25, 0.5, 1, 2, 3, 5, 8, 13, 21, 34]
+          value: Double(attributes["ttft_ms"]) / 1000.0
+
+      # Context consumption per tool — file rereads and giant tool outputs are what
+      # blow the context window (and the cache_creation bill).
+      - name: claude_code.tool.result_bytes
+        description: Bytes returned into the model context by tool results.
+        unit: By
+        conditions:
+          - attributes["event.name"] == "tool_result" and attributes["tool_result_size_bytes"] != nil
+        attributes:
+          - { key: gen_ai.tool.name, default_value: unknown }
+          - { key: gen_ai.conversation.id, optional: true }
+        sum:
+          value: Int(attributes["tool_result_size_bytes"])
+          monotonic: true
+
+      # Subagent wall time (Agent tool fan-out) by agent type and model.
+      - name: claude_code.subagent.duration
+        description: Subagent run duration.
+        unit: s
+        conditions:
+          - attributes["event.name"] == "subagent_completed" and attributes["duration_ms"] != nil
+        attributes:
+          - { key: agent_type, default_value: unknown }
+          - { key: model, optional: true }
+        histogram:
+          buckets: [5, 15, 30, 60, 120, 300, 600, 1200]
+          value: Double(attributes["duration_ms"]) / 1000.0
+
+      # Context reclaimed by compaction (manual or auto).
+      - name: claude_code.compaction.tokens_reclaimed
+        description: Tokens removed from context by compaction.
+        unit: "{token}"
+        conditions:
+          - attributes["event.name"] == "compaction" and attributes["cc.compaction.tokens_reclaimed"] != nil
+        attributes:
+          - { key: trigger, default_value: unknown }
+          - { key: gen_ai.conversation.id, optional: true }
+        sum:
+          value: Int(attributes["cc.compaction.tokens_reclaimed"])
+          monotonic: true
+
+  # R5: tool-call counts per conversation (OneAgent "tool calls" equivalent)
+  count:
+    # ---- events layer: the Datadog-console-style session analytics ----------
+    logs:
+      # turns per session (Datadog "average turns per session")
+      claude_code.turns:
+        description: User prompts (turns) per Claude Code session.
+        conditions:
+          - attributes["event.name"] == "user_prompt"
+        attributes:
+          - { key: gen_ai.conversation.id, default_value: unknown }
+          - { key: command_source, default_value: prompt }   # builtin|custom|mcp slash commands vs free prompts
+      # tool outcomes — failures by tool and error class; bash commands by class
+      # (vcs_commit with no preceding `test` in the session = "skipped checks")
+      claude_code.tool.results:
+        description: Tool results by tool, success and bash command class.
+        conditions:
+          - attributes["event.name"] == "tool_result"
+        attributes:
+          - { key: gen_ai.tool.name, default_value: unknown }
+          - { key: success, default_value: unknown }
+          - { key: error_type, default_value: none }
+          - { key: cc.bash.class, default_value: n/a }
+          - { key: gen_ai.conversation.id, default_value: unknown }
+      # permission friction — rejects, auto-mode gate denials, hook blocks
+      claude_code.tool.decisions:
+        description: Tool permission decisions by decision and source.
+        conditions:
+          - attributes["event.name"] == "tool_decision"
+        attributes:
+          - { key: decision, default_value: unknown }
+          - { key: source, default_value: unknown }
+          - { key: gen_ai.tool.name, default_value: unknown }
+      claude_code.hook.executions:
+        description: Hook executions, with whether the hook blocked the action.
+        conditions:
+          - attributes["event.name"] == "hook_execution_complete"
+        attributes:
+          - { key: hook_event, default_value: unknown }
+          - { key: cc.hook.blocked, default_value: "false" }
+      claude_code.permission_mode.changes:
+        description: Permission-mode transitions (e.g. auto_gate_denied).
+        conditions:
+          - attributes["event.name"] == "permission_mode_changed"
+        attributes:
+          - { key: from_mode, default_value: unknown }
+          - { key: to_mode, default_value: unknown }
+          - { key: trigger, default_value: unknown }
+      # reliability — API errors (attempt > 1 = retry loop), refusals
+      claude_code.api.errors:
+        description: Anthropic API errors by status and attempt.
+        conditions:
+          - attributes["event.name"] == "api_error"
+        attributes:
+          - { key: model, default_value: unknown }
+          - { key: status_code, default_value: unknown }
+          - { key: attempt, default_value: "1" }
+      claude_code.api.refusals:
+        description: Model refusals by category.
+        conditions:
+          - attributes["event.name"] == "api_refusal"
+        attributes:
+          - { key: model, default_value: unknown }
+          - { key: category, default_value: undisclosed }
+      claude_code.api.requests:
+        description: API requests by model and spender class (main/subagent/auxiliary).
+        conditions:
+          - attributes["event.name"] == "api_request"
+        attributes:
+          - { key: gen_ai.request.model, default_value: unknown }
+          - { key: cc.query_source.class, default_value: unknown }
+          - { key: effort, default_value: default }
+      claude_code.compactions:
+        description: Context compactions.
+        conditions:
+          - attributes["event.name"] == "compaction"
+        attributes:
+          - { key: trigger, default_value: unknown }
+          - { key: success, default_value: unknown }
+      claude_code.subagents:
+        description: Subagent completions by type.
+        conditions:
+          - attributes["event.name"] == "subagent_completed"
+        attributes:
+          - { key: agent_type, default_value: unknown }
+    spans:
+      gen_ai.agent.tool_calls:
+        description: Tool executions per Claude Code session.
+        conditions:
+          - attributes["gen_ai.operation.name"] == "execute_tool"
+        attributes:
+          - { key: gen_ai.conversation.id, default_value: unknown }
+          - { key: gen_ai.tool.name, default_value: unknown }
+      # §4: request-outcome mix — tool_use vs end_turn vs max_tokens (truncation).
+      # Grafana cannot show this; it is the clearest signal of agentic-loop behaviour.
+      gen_ai.request.count:
+        description: LLM requests by stop reason and model.
+        conditions: [ name == "claude_code.llm_request" ]
+        attributes:
+          - { key: stop_reason, default_value: unknown }
+          - { key: gen_ai.request.model, default_value: unknown }
+
+exporters:
+  otlp_http/dynatrace:
+    endpoint: ${env:DT_ENDPOINT}/api/v2/otlp
+    headers:
+      Authorization: "Api-Token ${env:DT_API_TOKEN}"
+  debug: { verbosity: normal }
+
+service:
+  telemetry:
+    # Collector SELF-metrics endpoint. The default localhost:8888 is commonly taken
+    # by other dev tools (it was on the first test machine), which aborts startup —
+    # so it is pinned to a less contested port. Scrape it or ignore it.
+    metrics:
+      level: basic
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: 127.0.0.1
+                port: 18888
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, resource_detection/dynatrace, resource/host_identity, transform/cc_enrich, batch]
+      exporters: [otlp_http/dynatrace, signal_to_metrics, count]
+    metrics:
+      # host_metrics + resource_detection + host_identity: host AND derived GenAI metrics
+      # all inherit the same host entity (dt.entity.host or stable host.id).
+      receivers: [otlp, host_metrics, signal_to_metrics, count]
+      processors: [memory_limiter, filter/host_metrics, resource_detection/dynatrace, resource/host_identity, transform/host_metrics, cumulative_to_delta/host_metrics, batch]
+      exporters: [otlp_http/dynatrace]
+    logs:
+      # events layer: enrich (cost, ttft, tool file/bash class, severities) then
+      # fan out to Dynatrace AND the metric connectors (session analytics).
+      receivers: [otlp]
+      processors: [memory_limiter, resource_detection/dynatrace, resource/host_identity, transform/cc_events, batch]
+      exporters: [otlp_http/dynatrace, signal_to_metrics, count]

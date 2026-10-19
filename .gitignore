@@ -1,0 +1,11 @@
+# Dynatrace credentials — never commit
+auto-monitoring/collector.env
+*.pre-automon.bak
+
+# host-id cache / scratch
+.dynatrace-otel/
+
+# Python / macOS noise
+__pycache__/
+*.pyc
+.DS_Store
