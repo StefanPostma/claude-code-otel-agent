@@ -1,0 +1,33 @@
+{
+  "_comment": "Dynamic routes that hand OTel host telemetry to the OpenTelemetry Host Monitoring extension's pipelines. pipelineCustomId is resolved to the tenant-specific settings objectId at apply time (see apply-routes.py). Order matters only relative to existing routes: logs/spans routes are APPENDED so specialised routes (e.g. the Claude Code GenAI route) keep priority.",
+  "metrics": {
+    "schema": "builtin:openpipeline.metrics.routing",
+    "pipelineCustomId": "extension.opentelemetry-metrics",
+    "entry": {
+      "description": "OpenTelemetry host/process metrics (host.id) -> OpenTelemetry Host Monitoring extension pipeline (creates OTEL_HOST / OTEL_PROCESS in Smartscape)",
+      "enabled": true,
+      "matcher": "matchesValue(metric.key, {\"system.*\", \"process.*\"}) and isNotNull(host.id)",
+      "pipelineType": "custom"
+    }
+  },
+  "logs": {
+    "schema": "builtin:openpipeline.logs.routing",
+    "pipelineCustomId": "extension.opentelemetry-logs",
+    "entry": {
+      "description": "OpenTelemetry logs with host identity -> OpenTelemetry Host Monitoring extension pipeline (links records to OTEL_HOST). Appended last: specialised routes above keep priority.",
+      "enabled": true,
+      "matcher": "isNotNull(host.id) and isNotNull(host.name) and matchesValue(dt.openpipeline.source, \"/api/v2/otlp/v1/logs\")",
+      "pipelineType": "custom"
+    }
+  },
+  "spans": {
+    "schema": "builtin:openpipeline.spans.routing",
+    "pipelineCustomId": "extension.opentelemetry-spans",
+    "entry": {
+      "description": "OpenTelemetry spans with host identity -> OpenTelemetry Host Monitoring extension pipeline (links spans to OTEL_HOST, service runs_on edge). Appended last: Claude Code GenAI route keeps priority.",
+      "enabled": true,
+      "matcher": "isNotNull(host.id) and isNotNull(host.name) and matchesValue(telemetry.sdk.name, {\"opentelemetry\", \"odin\", \"otel\"})",
+      "pipelineType": "custom"
+    }
+  }
+}
