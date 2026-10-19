@@ -66,6 +66,7 @@ chk "metric agent.tool_calls"             'Name: gen_ai.agent.tool_calls'
 chk "metric request.count"                'Name: gen_ai.request.count'
 chk "host_metrics system.cpu.*"           'Name: system.cpu.'
 chk "host_metrics system.memory.*"        'Name: system.memory.'
+chk "host_metrics process.cpu.utilization" 'Name: process.cpu.utilization'
 absent "tmp.* scratch keys cleaned up"    '-> tmp.'
 echo "---- events layer (log stream) ----"
 chk "E1 authoritative cost on api_request" 'gen_ai.usage.cost: Double(0.11420325)'

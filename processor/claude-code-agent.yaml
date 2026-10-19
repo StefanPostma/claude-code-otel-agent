@@ -53,6 +53,15 @@ receivers:
       system: {}               # system.uptime
       process:                 # per-process CPU/memory — OneAgent-like, needs privileges
         mute_process_all_errors: true
+        # Same per-process set as Dynatrace's reference host-metrics.yaml. process.cpu.utilization
+        # is OFF by default upstream — without it the OpenTelemetry Processes view has no CPU %.
+        # No low-memory process filter here: every process becomes an OTEL_PROCESS node.
+        metrics:
+          process.cpu.utilization:  { enabled: true }
+          process.cpu.time:         { enabled: true }
+          process.memory.usage:     { enabled: true }
+          process.memory.virtual:   { enabled: true }
+          process.disk.io:          { enabled: true }   # needs privileges; muted if unavailable
 
 processors:
   memory_limiter:

@@ -170,6 +170,13 @@ fetch spans | filter service.name == "claude-code" and isNotNull(host.id)
 prerequisites are already in the config: counters go out as **delta** (`cumulative_to_delta`;
 Dynatrace drops cumulative monotonic sums silently) and `process.*` metrics are keyed by
 executable name only (pid/command line stripped), otherwise cardinality explodes.
+The host page's **Processes** tab (the OneAgent-style per-process table with CPU and memory)
+stays at a bare process-count chart until `process.cpu.utilization` arrives, and the hostmetrics
+receiver ships that metric **disabled**. The config therefore enables the same per-process set as
+Dynatrace's reference `host-metrics.yaml` (cpu.utilization, cpu.time, memory.usage,
+memory.virtual, disk.io); with it the tab fills in. The same processes are listed under
+**OpenTelemetry › Processes** in the sidebar. No low-memory process filter is applied: every
+process becomes an `OTEL_PROCESS` node.
 Background and evidence: [`research/host-entity-model.md`](research/host-entity-model.md) §8–9.
 
 ## Relationship to dynatrace-oss PR #353

@@ -122,7 +122,7 @@ Three independent prerequisites, all required:
 | 2 | **OpenTelemetry Host Monitoring extension** | Metrics never create an entity by themselves. The `otel:host` (Smartscape `OTEL_HOST`) entity is minted by the extension from `host.id` + `host.name` (+ `os.type`). | Tenant-side: Dynatrace Hub, `com.dynatrace.extension.opentelemetry` (a current version with Smartscape-on-Grail support). |
 | 3 | **OpenPipeline routes to the extension pipelines** | The extension only sees data that is routed to its pipelines; it installs no routes itself. | `openpipeline/routes.json` + `openpipeline/apply-routes.py` (matchers in the README). |
 
-Also aligned with the reference config: cpu `idle` state filtered, `process.*` resource
+Also aligned with the reference config: the per-process metric set is enabled explicitly (`process.cpu.utilization` is off by default upstream and is what the host page's Processes tab and the OpenTelemetry Processes view need; without it only cpu.time/memory.usage/memory.virtual arrive and the tab shows just a process count), cpu `idle` state filtered, `process.*` resource
 identity reduced to `process.executable.name` (pid/command_line/args/owner/path dropped —
 otherwise every process restart is a new series), `host.ip` scalarised, extra system-detector
 facts (`host.arch`, `host.ip`, `host.mac`, `host.cpu.model.name`, `os.name`, `os.version`,
