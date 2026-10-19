@@ -111,88 +111,68 @@ deep-code auto-instrumentation, automatic service/PGI discovery and the Smartsca
 tracing, or RUM. Those remain OneAgent-exclusive. Enable `host_metrics` **only** where
 OneAgent is not installed — running both double-reports host metrics.
 
-## 8. Why the metrics arrived but no host appeared in Smartscape (2026-10-18, live)
-First live run through the launchd collector: `system.*` metrics with `host.id`/`host.name`/
-`os.type` were on the test tenant within minutes — yet Infrastructure & Operations › Hosts showed nothing
-and `smartscapeNodes OTEL_HOST` returned zero rows. Three independent causes, all verified:
+## 8. Why metrics alone do not put a host in Smartscape
+`system.*` metrics with `host.id`/`host.name`/`os.type` can be visible in Grail while
+Infrastructure & Operations › Hosts stays empty and `smartscapeNodes OTEL_HOST` returns no rows.
+Three independent prerequisites, all required:
 
-| # | Cause | Evidence | Fix |
+| # | Requirement | Why | Where it is handled |
 |---|---|---|---|
-| 1 | **Cumulative counters are dropped silently.** Dynatrace ingests delta sums only; the collector logs no warning. | `fetch metric.series` showed only gauges (utilization, usage, load, counts). `system.cpu.time`, `system.network.io`, `system.disk.io`, `system.paging.operations`, `process.cpu.time` were absent. | `cumulative_to_delta/host_metrics` (scoped to `^system\.`/`^process\.`) — as in Dynatrace's reference `host-metrics.yaml`. |
-| 2 | **Metrics never create an entity by themselves.** The `otel:host` (Smartscape `OTEL_HOST`) entity is minted by the **OpenTelemetry Host Monitoring extension** from `host.id` + `host.name` (+ `os.type`). | Docs: "Without the extension no host entity is created." | Activate the extension from Dynatrace Hub (a current version with Smartscape-on-Grail support). Tenant-side; cannot be done from the collector. |
-| 3 | **Smartscape needs routing.** The extension only sees data routed to its pipeline. | `OTEL_HOST` requires three OpenPipeline dynamic routes. | Settings › Process and contextualize › OpenPipeline, target pipeline **OpenTelemetry Host Monitoring**: <br>• Metrics: `matchesValue(metric.key, {"system.*", "process.*"}) AND isNotNull(host.id)` <br>• Logs: `isNotNull(host.id) and isNotNull(host.name) and matchesValue(dt.openpipeline.source, "/api/v2/otlp/v1/logs")` <br>• Spans: `isNotNull(host.id) and isNotNull(host.name) and matchesValue(telemetry.sdk.name, {"opentelemetry", "odin", "otel"})` |
+| 1 | **Delta temporality for counters** | Dynatrace ingests delta sums only; cumulative counters (`system.cpu.time`, `system.network.io`, `system.disk.io`, `system.paging.operations`, `process.cpu.time`) are dropped **silently** — only gauges arrive and the collector logs nothing. | `cumulative_to_delta/host_metrics` (scoped to `^system\.`/`^process\.`), as in Dynatrace's reference `host-metrics.yaml`. |
+| 2 | **OpenTelemetry Host Monitoring extension** | Metrics never create an entity by themselves. The `otel:host` (Smartscape `OTEL_HOST`) entity is minted by the extension from `host.id` + `host.name` (+ `os.type`). | Tenant-side: Dynatrace Hub, `com.dynatrace.extension.opentelemetry` (a current version with Smartscape-on-Grail support). |
+| 3 | **OpenPipeline routes to the extension pipelines** | The extension only sees data that is routed to its pipelines; it installs no routes itself. | `openpipeline/routes.json` + `openpipeline/apply-routes.py` (matchers in the README). |
 
 Also aligned with the reference config: cpu `idle` state filtered, `process.*` resource
-identity reduced to `process.executable.name` (pid/command_line/args/owner/path dropped — the
-first run produced 936 series per process metric), `host.ip` scalarised, extra system-detector
+identity reduced to `process.executable.name` (pid/command_line/args/owner/path dropped —
+otherwise every process restart is a new series), `host.ip` scalarised, extra system-detector
 facts (`host.arch`, `host.ip`, `host.mac`, `host.cpu.model.name`, `os.name`, `os.version`,
 `os.build.id`) so the extension can fill the entity's properties.
 
 **What this means for the "missing link".** On a OneAgent-less host the entity is not
 produced by the collector but by the tenant-side extension, from the identity the collector
-supplies. Our stable `host.id` is therefore the *key*; the extension is the *lock*. With both
-in place the Claude Code spans/logs (which carry the same `host.id`) attach to the `OTEL_HOST`
-node — the OneAgent-style "agent runs on this host" view.
+supplies. The stable `host.id` is the *key*; the extension is the *lock*. With both in place
+the Claude Code spans/logs (which carry the same `host.id`) attach to the `OTEL_HOST` node —
+the OneAgent-style "agent runs on this host" view.
 
 Verification once the extension and routes are active:
 ```sql
 smartscapeNodes OTEL_HOST | fields id, name, host.id, os.type
 ```
-(`fetch dt.entity.otel:host` is **not** accepted by the DQL parser on the test tenant — the colon breaks the
+(`fetch dt.entity.otel:host` is not accepted by the DQL parser — the colon breaks the
 parameter name; use `smartscapeNodes OTEL_HOST`.)
 
-## 9. What the extension actually installs (read live via dtctl, 2026-10-18)
-The **com.dynatrace.extension.opentelemetry** extension was installed on the test tenant. It does not add
-processors to existing pipelines; it installs three *custom* pipelines as Settings 2.0 objects
-(`builtin:openpipeline.{metrics,logs,spans}.pipelines`, `customId` =
-`extension.opentelemetry-{metrics,logs,spans}`, displayName "OpenTelemetry Host Monitoring"),
-and **no routes**. Their content explains the three-route requirement precisely:
+## 9. What the extension installs, and why three routes
+The extension does not add processors to existing pipelines. It installs three *custom*
+pipelines as Settings 2.0 objects (`builtin:openpipeline.{metrics,logs,spans}.pipelines`,
+`customId` = `extension.opentelemetry-{metrics,logs,spans}`, displayName "OpenTelemetry Host
+Monitoring") and **no routes**. Their content explains the three-route requirement:
 
 | Pipeline | Stage | Processor | Effect |
 |---|---|---|---|
-| metrics | smartscapeNodeExtraction | `OTEL_HOST_host_metrics_extraction` — matcher `matchesValue(metric.key, {"system.*", "process.*"}) AND isNotNull(host.id)` | **`extractNode: true`** → this is the only place the `OTEL_HOST` node is *created*; id components `host.id`+`host.name`, properties from `os.*`, `host.arch`, cloud ids, `dt.host_group.id` |
-| metrics | smartscapeNodeExtraction | `OTEL_PROCESS_process_extraction` — `process.*` AND `process.executable.name` AND `host.id` | creates `OTEL_PROCESS` nodes (one per executable name — hence our pid/command_line stripping) |
+| metrics | smartscapeNodeExtraction | `OTEL_HOST_host_metrics_extraction` — matcher `matchesValue(metric.key, {"system.*", "process.*"}) AND isNotNull(host.id)` | **`extractNode: true`** → the only place the `OTEL_HOST` node is *created*; id components `host.id`+`host.name`, properties from `os.*`, `host.arch`, cloud ids, `dt.host_group.id` |
+| metrics | smartscapeNodeExtraction | `OTEL_PROCESS_process_extraction` — `process.*` AND `process.executable.name` AND `host.id` | creates `OTEL_PROCESS` nodes (one per executable name — hence the pid/command_line stripping) |
 | metrics | smartscapeNodeExtraction | AWS_EC2 / AZURE_VM / GCP id computation | `extractNode: false`; only computes the cloud-VM id for correlation |
 | logs | smartscapeNodeExtraction | `OTEL_HOST_logs_enrichment`, `OTEL_PROCESS_logs_enrichment` | `extractNode: false` → only writes `dt.smartscape.otel_host` / `dt.smartscape.otel_process` onto the record (linking) |
-| spans | smartscapeNodeExtraction | `OTEL_HOST_spans_enrichment`, `OTEL_PROCESS_spans_enrichment` | same linking fields on spans |
+| spans | smartscapeNodeExtraction | `OTEL_HOST_spans_enrichment`, `OTEL_PROCESS_spans_enrichment` | same linking fields on spans; matcher also requires `telemetry.sdk.name ∈ {opentelemetry, odin, otel}` |
 | spans | smartscapeEdgeExtraction | `OTEL_HOST_service_linking`, `OTEL_PROCESS_service_linking` | `runs_on` edge SERVICE → OTEL_HOST / OTEL_PROCESS when `dt.smartscape.service` is set |
 
 Consequences:
 - **Only the metrics route creates the host.** Logs/spans routes are about *linking* and the
-  service→host edge. So the Smartscape Hosts view appears as soon as the metrics route is active.
-- **Routing is first-match.** the test tenant already routes `service.name == "claude-code"` spans and
-  `assistant_response`/`user_prompt` logs to the custom "Claude Code GenAI" pipelines. Putting
-  the host route *before* them would strip Claude Code of its GenAI enrichment; putting it
-  *after* means Claude Code signals never reach the extension pipeline and get no
+  service→host edge, so the Hosts view appears as soon as the metrics route is active.
+- **Routing is first-match.** A tenant that already routes `service.name == "claude-code"`
+  spans and `assistant_response`/`user_prompt` logs to custom "Claude Code GenAI" pipelines
+  cannot put the host route *before* them (Claude Code would lose its GenAI enrichment), and
+  putting it *after* means those signals never reach the extension pipeline and get no
   `dt.smartscape.otel_host`. The fix that keeps both is to copy the extension's two Smartscape
   stages (pure id computation, no side effects) into the Claude Code pipelines —
-  `openpipeline/apply-routes.py --link-claude-code` does exactly that.
-- the test tenant state before applying: metrics routing object **absent** (0 routes), logs routing 13 routes
-  (OCSF/syslog project + Claude Code GenAI logs), spans routing 1 route (Claude Code GenAI).
+  `openpipeline/apply-routes.py --link-claude-code` does exactly that. The `processing` and
+  `metricExtraction` stages of those pipelines are untouched, so the GenAI Observability app
+  is unaffected.
+- **Spans need `telemetry.sdk.name`.** Claude Code's spans reach Grail without any
+  `telemetry.sdk.*` attribute, so the extension's span matcher never fires for them while logs
+  (matched on `dt.openpipeline.source`) link fine. The collector's `resource/host_identity`
+  therefore *inserts* `telemetry.sdk.name = opentelemetry` when absent. The spans already carry
+  `dt.smartscape.service`, so the `runs_on` SERVICE → OTEL_HOST edge follows.
 
-**Result (2026-10-19, user ran `apply-routes.py --link-claude-code`).** Within minutes:
-an `OTEL_HOST-…` node named after the Mac (host.id = the 16-hex machine-id derivative, darwin/arm64,
-macOS 26.6.2) plus ~90 `OTEL_PROCESS` nodes; host-metric series carry
-`dt.smartscape.otel_host` from the first 10-minute bucket after the apply. Claude Code **logs**
-link immediately (`dt.smartscape.otel_host` set in both the extension pipeline and the Claude
-Code GenAI logs pipeline). Claude Code **spans did not link**: the extension's span matcher
-also requires `telemetry.sdk.name ∈ {opentelemetry, odin, otel}`, and Claude Code's spans reach
-Grail without any `telemetry.sdk.*` attribute. Fix in the collector, not the tenant:
-`resource/host_identity` now *inserts* `telemetry.sdk.name = opentelemetry` when absent. The
-spans already carry `dt.smartscape.service`, so the `runs_on` SERVICE → OTEL_HOST edge follows.
-
-**No regression for the GenAI app.** The Claude Code GenAI pipelines' `processing` and
-`metricExtraction` stages are byte-identical before/after the linking update (only the two
-Smartscape stages were added), and every `claude_code.llm_request` span of the last 26 h has
-`gen_ai.provider.name`, `gen_ai.system`, `gen_ai.operation.name`, `gen_ai.request.model`,
-`gen_ai.response.model` and token counts (100 % per hour). A "no data" view in the GenAI
-Observability app on 2026-10-19 coincided with a 5-hour gap without any Claude Code activity
-(12:48–17:46 UTC), not with the routing change.
-
-**Tooling.** The Dynatrace MCP (remote gateway) exposes no OpenPipeline or
-Settings tool, and the collector's API token has no `settings:*` scope. `dtctl` (logged in to the test tenant) can read and write the settings objects;
-`dtctl create settings --validate-only` accepted the metrics route (the server validates the
-matcher). `dtctl verify openpipeline-matcher` needs `openpipeline:configurations:read`, which the
-OAuth session lacks — the settings validation covers it. Writing the routes from an agent session
-was blocked by Claude Code's auto-mode policy ("Protected-Scope IaC Apply"), so the apply is a
-user-run step: `./openpipeline/apply-routes.py` (idempotent; `--dry-run` first).
+The routes and pipelines are plain Settings 2.0 objects; `apply-routes.py` reads and writes them
+through [dtctl](https://github.com/dynatrace-oss/dtctl) and is idempotent (`--dry-run` first).
