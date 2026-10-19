@@ -1,0 +1,17 @@
+# Linux systemd USER unit: keeps the Claude Code observability collector always running.
+# __REPO_DIR__ is substituted by install.sh. Installed to ~/.config/systemd/user/.
+# start-collector.sh sources auto-monitoring/collector.env itself (token stays in one file).
+[Unit]
+Description=Claude Code observability agent (OpenTelemetry Collector)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=__REPO_DIR__
+ExecStart=/bin/bash __REPO_DIR__/start-collector.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

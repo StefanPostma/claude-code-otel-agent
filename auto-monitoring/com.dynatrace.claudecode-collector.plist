@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- macOS LaunchAgent: keeps the Claude Code observability collector always running.
+     __REPO_DIR__ / __HOME__ are substituted by install.sh. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.dynatrace.claudecode-collector</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>__REPO_DIR__/start-collector.sh</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>__REPO_DIR__</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>__HOME__/Library/Logs/claudecode-collector.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/Library/Logs/claudecode-collector.err.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- launchd has a minimal PATH; include Homebrew so otelcol-contrib resolves, and
+         /usr/sbin because the collector's `system` resource detector shells out to
+         `ioreg` on macOS — without it the collector aborts at startup. -->
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+</dict>
+</plist>
