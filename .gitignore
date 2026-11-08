@@ -9,3 +9,6 @@ auto-monitoring/collector.env
 __pycache__/
 *.pyc
 .DS_Store
+
+# graphify knowledge-graph output (generated)
+graphify-out/
