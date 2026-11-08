@@ -23,6 +23,69 @@ receivers:
       grpc: { endpoint: 0.0.0.0:4317 }
       http: { endpoint: 0.0.0.0:4318 }
 
+  # macOS SECURITY EVENTS — unified log records written as NDJSON by
+  # macos-security/macos-security-log.sh (started by start-collector.sh). The predicate
+  # catalogue lives in macos-security/predicates.json. Unified-log JSON keys are mapped to
+  # OTel/Semantic-Dictionary names here; classification (event.category/type/outcome,
+  # security-event extraction) is done tenant-side in the OpenPipeline rule set
+  # (openpipeline/macos-security.json) so it can be tuned without touching the host.
+  filelog/macos_security:
+    include: ["${env:MACOS_SECURITY_LOG_DIR:-/tmp/dynatrace-otel-macos-security}/unified-*.ndjson"]
+    start_at: beginning          # + file_storage checkpoints → no gaps, no duplicates across restarts
+    storage: file_storage/macos_security
+    operators:
+      - type: json_parser
+        parse_from: body
+        on_error: send_quiet
+        timestamp: { parse_from: attributes.timestamp, layout: "%Y-%m-%d %H:%M:%S.%f%z" }
+        severity:
+          parse_from: attributes.messageType
+          mapping: { info: [Default, Info], debug: Debug, error: Error, fatal: Fault }
+      - { type: move, from: attributes.eventMessage,     to: body,                                   on_error: send_quiet }
+      - { type: move, from: attributes.subsystem,        to: 'attributes["macos.subsystem"]',          on_error: send_quiet }
+      - { type: move, from: attributes.category,         to: 'attributes["macos.category"]',           on_error: send_quiet }
+      - { type: move, from: attributes.messageType,      to: 'attributes["macos.message_type"]',       on_error: send_quiet }
+      - { type: move, from: attributes.eventType,        to: 'attributes["macos.event_type"]',         on_error: send_quiet }
+      - { type: move, from: attributes.bootUUID,         to: 'attributes["macos.boot_uuid"]',          on_error: send_quiet }
+      - { type: move, from: attributes.senderImagePath,  to: 'attributes["macos.sender.image_path"]',  on_error: send_quiet }
+      - { type: move, from: attributes.processImagePath, to: 'attributes["process.executable.path"]',  on_error: send_quiet }
+      - { type: move, from: attributes.processID,        to: 'attributes["process.pid"]',              on_error: send_quiet }
+      - { type: move, from: attributes.userID,           to: 'attributes["user.id"]',                  on_error: send_quiet }
+      - { type: remove, field: attributes.timestamp,                on_error: send_quiet }
+      - { type: remove, field: attributes.formatString,             on_error: send_quiet }
+      - { type: remove, field: attributes.backtrace,                on_error: send_quiet }
+      - { type: remove, field: attributes.traceID,                  on_error: send_quiet }
+      - { type: remove, field: attributes.activityIdentifier,       on_error: send_quiet }
+      - { type: remove, field: attributes.parentActivityIdentifier, on_error: send_quiet }
+      - { type: remove, field: attributes.threadID,                 on_error: send_quiet }
+      - { type: remove, field: attributes.machTimestamp,            on_error: send_quiet }
+      - { type: remove, field: attributes.senderImageUUID,          on_error: send_quiet }
+      - { type: remove, field: attributes.processImageUUID,         on_error: send_quiet }
+      - { type: remove, field: attributes.senderProgramCounter,     on_error: send_quiet }
+      - { type: remove, field: attributes.timezoneName,             on_error: send_quiet }
+      - { type: remove, field: attributes.source,                   on_error: send_quiet }
+      - { type: add, field: 'resource["log.source"]', value: "macos:unified_log" }
+
+  # OPTIONAL — Endpoint Security events from macos-security/eslogger-sidecar.sh (root +
+  # Full Disk Access; not started automatically). Kept generic: the raw ES JSON stays in
+  # the body, only identity fields are lifted, the OpenPipeline rule set parses the rest.
+  filelog/macos_eslogger:
+    include: ["${env:MACOS_SECURITY_LOG_DIR:-/tmp/dynatrace-otel-macos-security}/eslogger-*.ndjson"]
+    start_at: beginning
+    storage: file_storage/macos_security
+    operators:
+      - type: json_parser
+        parse_from: body
+        parse_to: attributes.es
+        on_error: send_quiet
+        timestamp: { parse_from: attributes.es.time, layout_type: gotime, layout: "2006-01-02T15:04:05.999999999Z07:00" }
+      - { type: copy, from: attributes.es.event_type,                 to: 'attributes["macos.es.event_type"]',     on_error: send_quiet }
+      - { type: copy, from: attributes.es.process.executable.path,    to: 'attributes["process.executable.path"]', on_error: send_quiet }
+      - { type: copy, from: attributes.es.process.audit_token.pid,    to: 'attributes["process.pid"]',             on_error: send_quiet }
+      - { type: copy, from: attributes.es.process.audit_token.euid,   to: 'attributes["user.id"]',                 on_error: send_quiet }
+      - { type: remove, field: attributes.es, on_error: send_quiet }
+      - { type: add, field: 'resource["log.source"]', value: "macos:endpoint_security" }
+
   # HOST METRICS — only when OneAgent is NOT on this host. Gives Dynatrace the
   # infra layer (CPU/mem/disk/net/process) a OneAgent would report, bound to the
   # same host entity via the host-identity processors below.
@@ -116,6 +179,27 @@ processors:
       # telemetry.sdk.name ∈ {opentelemetry, odin, otel} (logs use dt.openpipeline.source
       # instead, so they linked fine). insert = only when absent — verified live 2026-10-19.
       - { key: telemetry.sdk.name, value: opentelemetry, action: insert }
+
+  # Claude Code spans/logs carry no process.* resource attributes, so the extension can
+  # only link them to the host. With the executable name they also link to the OTEL_PROCESS
+  # node that host_metrics creates for the `claude` binary (dt.smartscape.otel_process +
+  # the SERVICE -> OTEL_PROCESS runs_on edge). Traces and logs pipelines ONLY — never on
+  # metrics, where it would stamp the host-level system.* series as the claude process.
+  resource/cc_process:
+    attributes:
+      - { key: process.executable.name, value: claude, action: insert }
+
+  # macOS security records: derive process.name from the executable path; nothing else
+  # is classified here (see the OpenPipeline rule set).
+  transform/macos_security:
+    error_mode: ignore
+    log_statements:
+      - context: log
+        statements:
+          - set(attributes["process.name"], attributes["process.executable.path"]) where attributes["process.executable.path"] != nil
+          - replace_pattern(attributes["process.name"], "^.*/", "") where attributes["process.name"] != nil
+          - set(attributes["process.pid"], Int(attributes["process.pid"])) where attributes["process.pid"] != nil
+          - set(attributes["user.id"], String(attributes["user.id"])) where attributes["user.id"] != nil
 
   # HOST METRICS SHAPING — aligned with Dynatrace's reference host-metrics.yaml
   # (github.com/Dynatrace/dynatrace-otel-collector config_examples) so the
@@ -593,7 +677,14 @@ exporters:
       Authorization: "Api-Token ${env:DT_API_TOKEN}"
   debug: { verbosity: normal }
 
+extensions:
+  # filelog checkpoints for the macOS security receivers (survive collector restarts)
+  file_storage/macos_security:
+    directory: "${env:MACOS_SECURITY_LOG_DIR:-/tmp/dynatrace-otel-macos-security}/.checkpoints"
+    create_directory: true
+
 service:
+  extensions: [file_storage/macos_security]
   telemetry:
     # Collector SELF-metrics endpoint. The default localhost:8888 is commonly taken
     # by other dev tools (it was on the first test machine), which aborts startup —
@@ -609,7 +700,7 @@ service:
   pipelines:
     traces:
       receivers: [otlp]
-      processors: [memory_limiter, resource_detection/dynatrace, resource/host_identity, transform/cc_enrich, batch]
+      processors: [memory_limiter, resource_detection/dynatrace, resource/host_identity, resource/cc_process, transform/cc_enrich, batch]
       exporters: [otlp_http/dynatrace, signal_to_metrics, count]
     metrics:
       # host_metrics + resource_detection + host_identity: host AND derived GenAI metrics
@@ -621,5 +712,11 @@ service:
       # events layer: enrich (cost, ttft, tool file/bash class, severities) then
       # fan out to Dynatrace AND the metric connectors (session analytics).
       receivers: [otlp]
-      processors: [memory_limiter, resource_detection/dynatrace, resource/host_identity, transform/cc_events, batch]
+      processors: [memory_limiter, resource_detection/dynatrace, resource/host_identity, resource/cc_process, transform/cc_events, batch]
       exporters: [otlp_http/dynatrace, signal_to_metrics, count]
+    logs/macos_security:
+      # macOS security events/logs: own pipeline so they carry the host identity but
+      # none of the Claude Code enrichment or session metrics.
+      receivers: [filelog/macos_security, filelog/macos_eslogger]
+      processors: [memory_limiter, resource_detection/dynatrace, resource/host_identity, transform/macos_security, batch]
+      exporters: [otlp_http/dynatrace]

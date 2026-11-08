@@ -18,6 +18,11 @@ receivers:
       http: { endpoint: 127.0.0.1:14318 }
   host_metrics:
     collection_interval: 5s
+  # macOS security receiver reads the synthetic fixture instead of the sidecar output
+  # (MACOS_SECURITY_LOG_DIR is set to a fresh temp dir by smoke-test.sh, so file_storage
+  # checkpoints never carry over between runs).
+  filelog/macos_security:
+    include: ["test/sample-macos-unified-log.ndjson"]
 
 service:
   telemetry:
@@ -36,3 +41,5 @@ service:
       exporters: [debug]
     logs:
       exporters: [debug, signal_to_metrics, count]
+    logs/macos_security:
+      exporters: [debug]

@@ -1,0 +1,221 @@
+{
+  "_comment": "OpenPipeline rule set for macOS security events from the agent (log.source macos:unified_log / macos:endpoint_security). Applied by openpipeline/apply-macos-security.py: creates/updates the custom logs pipeline by customId, inserts the route BEFORE the OpenTelemetry Host Monitoring route (first-match routing), and copies the extension's Smartscape linking stage so records still attach to the OTEL_HOST. Processing follows the Windows/auditd pipelines' Semantic Dictionary contract: event.provider, event.category/type/outcome, user.name, source.ip, process.*; the data-extraction stage emits security events for the notable subset.",
+  "route": {
+    "schema": "builtin:openpipeline.logs.routing",
+    "insertBeforePipelineCustomId": "extension.opentelemetry-logs",
+    "entry": {
+      "description": "macOS security events & logs from the Claude Code OTel agent (unified log + optional Endpoint Security) -> Semantic Dictionary + security events",
+      "enabled": true,
+      "matcher": "log.source == \"macos:unified_log\" or log.source == \"macos:endpoint_security\"",
+      "pipelineType": "custom"
+    }
+  },
+  "pipeline": {
+    "schema": "builtin:openpipeline.logs.pipelines",
+    "value": {
+      "customId": "pipeline_macos_security",
+      "displayName": "macOS security (unified log + Endpoint Security) -> Semantic Dictionary",
+      "metadataList": [],
+      "processing": {
+        "processors": [
+          {
+            "id": "macos_provider",
+            "type": "dql",
+            "enabled": true,
+            "description": "STAGE 0: stamp event.provider on every macOS record and normalise the executable basename, so coverage does not depend on a family processor below claiming the record.",
+            "matcher": "log.source == \"macos:unified_log\" or log.source == \"macos:endpoint_security\"",
+            "dql": {
+              "script": "fieldsAdd event.provider = coalesce(event.provider, if(log.source == \"macos:endpoint_security\", \"macos.endpoint_security\", else: \"macos.unified_log\"))\n| fieldsAdd process.name = coalesce(process.name, arrayLast(splitString(process.executable.path, \"/\")))\n| fieldsAdd host.os.type = \"darwin\""
+            }
+          },
+          {
+            "id": "macos_auth_opendirectory",
+            "type": "dql",
+            "enabled": true,
+            "description": "Open Directory / AccountPolicy authentication results (local login, SecureToken, password verification). Outcome from the message wording.",
+            "matcher": "macos.subsystem == \"com.apple.AccountPolicy\" or (macos.subsystem == \"com.apple.opendirectoryd\" and macos.category == \"auth\")",
+            "dql": {
+              "script": "fieldsAdd event.category = \"authentication\"\n| fieldsAdd event.type = \"authentication\"\n| fieldsAdd event.outcome = if(contains(content, \"Failed\") or contains(content, \"invalid credentials\") or contains(content, \"Failure\") or contains(content, \"denied\"), \"failure\", else: if(contains(content, \"Success\") or contains(content, \"Succeeded\") or contains(content, \"Allowed: \"), \"success\"))\n| fieldsAdd authentication.method = if(contains(content, \"SecureToken\"), \"securetoken\", else: \"opendirectory\")"
+            }
+          },
+          {
+            "id": "macos_auth_sshd",
+            "type": "dql",
+            "enabled": true,
+            "description": "OpenSSH logins: Accepted/Failed <method> for [invalid user] <user> from <ip> port <port>.",
+            "matcher": "process.name == \"sshd\" or process.name == \"sshd-session\" or macos.subsystem == \"com.apple.sshd\"",
+            "dql": {
+              "script": "fieldsAdd event.category = \"authentication\"\n| fieldsAdd event.type = \"authentication\"\n| fieldsAdd event.outcome = if(startsWith(content, \"Accepted\"), \"success\", else: if(startsWith(content, \"Failed\") or contains(content, \"Invalid user\") or contains(content, \"authentication failure\"), \"failure\"))\n| parse content, \"LD ' for ' ('invalid user ' LD:tmp_invalid)? WORD:tmp_user ' from ' IPADDR:tmp_ip ' port ' INT:tmp_port\"\n| fieldsAdd user.name = tmp_user, source.ip = tmp_ip, source.port = tmp_port, authentication.protocol = \"ssh\"\n| fieldsAdd user.exists = if(isNotNull(tmp_invalid), false, else: true)\n| fieldsRemove tmp_invalid, tmp_user, tmp_ip, tmp_port"
+            }
+          },
+          {
+            "id": "macos_sudo",
+            "type": "dql",
+            "enabled": true,
+            "description": "sudo: successful elevation is a process start with the target user and command; 'incorrect password attempt(s)', 'a password is required' (non-interactive sudo without cached credentials) and 'NOT in sudoers' are authentication failures. Matches only the audit line ('<user> : …'); sudo's own debug chatter stays unclassified.",
+            "matcher": "(process.name == \"sudo\" or macos.subsystem == \"com.apple.sudo\") and matchesValue(content, \"* : *\")",
+            "dql": {
+              "script": "parse content, \"WORD:tmp_user ' : ' LD:tmp_rest\"\n| fieldsAdd tmp_fail = contains(content, \"incorrect password\") or contains(content, \"NOT in sudoers\") or contains(content, \"command not allowed\") or contains(content, \"a password is required\") or contains(content, \"authentication failure\")\n| fieldsAdd event.category = if(tmp_fail, \"authentication\", else: \"process\")\n| fieldsAdd event.type = if(tmp_fail, \"authentication\", else: \"start\")\n| fieldsAdd event.outcome = if(tmp_fail, \"failure\", else: \"success\")\n| fieldsAdd user.name = tmp_user\n| parse content, \"LD 'USER=' WORD:tmp_target\"\n| parse content, \"LD 'COMMAND=' LD:tmp_cmd\"\n| parse content, \"LD 'TTY=' WORD:tmp_tty\"\n| fieldsAdd user.target.name = tmp_target, process.command_line = tmp_cmd, process.tty = tmp_tty, event.action = \"sudo\"\n| fieldsRemove tmp_user, tmp_rest, tmp_fail, tmp_target, tmp_cmd, tmp_tty"
+            }
+          },
+          {
+            "id": "macos_authorization",
+            "type": "dql",
+            "enabled": true,
+            "description": "authd authorization rights: 'Succeeded authorizing right X by client Y' / 'Failed to authorize right X'.",
+            "matcher": "macos.subsystem == \"com.apple.Authorization\" or (macos.subsystem == \"com.apple.securityd\" and macos.category == \"authorization\")",
+            "dql": {
+              "script": "fieldsAdd event.category = \"authentication\"\n| fieldsAdd event.type = \"authorization\"\n| fieldsAdd event.outcome = if(startsWith(content, \"Succeeded\"), \"success\", else: if(startsWith(content, \"Failed\") or contains(content, \"denied\"), \"failure\"))\n| parse content, \"LD 'right ' SQS:tmp_right\"\n| parse content, \"LD 'by client ' SQS:tmp_client\"\n| fieldsAdd authorization.right = tmp_right, process.client.path = tmp_client\n| fieldsRemove tmp_right, tmp_client"
+            }
+          },
+          {
+            "id": "macos_account_management",
+            "type": "dql",
+            "enabled": true,
+            "description": "User/group lifecycle via sysadminctl and dscl. Matches only messages about users, records, passwords, groups or admin rights; the tools' XPC/connection chatter stays unclassified (and emits no security event).",
+            "matcher": "(process.name == \"sysadminctl\" or process.name == \"dscl\" or macos.subsystem == \"com.apple.sysadminctl\") and (matchesValue(content, \"*user*\") or matchesValue(content, \"*User*\") or matchesValue(content, \"*record*\") or matchesValue(content, \"*password*\") or matchesValue(content, \"*Password*\") or matchesValue(content, \"*group*\") or matchesValue(content, \"*admin*\"))",
+            "dql": {
+              "script": "fieldsAdd event.category = \"iam\"\n| fieldsAdd event.type = if(contains(content, \"Creating\") or contains(content, \"create\"), \"user_created\", else: if(contains(content, \"Deleting\") or contains(content, \"delete\"), \"user_deleted\", else: if(contains(content, \"password\") or contains(content, \"Password\"), \"password_changed\", else: \"user_changed\")))\n| fieldsAdd event.outcome = if(contains(content, \"fail\") or contains(content, \"Fail\") or contains(content, \"error\"), \"failure\", else: \"success\")\n| parse content, \"LD 'user record for ' WORD:tmp_target\"\n| fieldsAdd user.target.name = tmp_target\n| fieldsAdd user.target.admin = contains(content, \"admin\")\n| fieldsRemove tmp_target"
+            }
+          },
+          {
+            "id": "macos_security_policy",
+            "type": "dql",
+            "enabled": true,
+            "description": "Gatekeeper / system policy assessments and XProtect detections. Denied assessments and detections are 'malware'/'intrusion_detection' style outcomes; everything else is configuration telemetry.",
+            "matcher": "macos.subsystem == \"com.apple.syspolicy\" or macos.subsystem == \"com.apple.XProtect\" or process.name == \"XProtectRemediator\" or process.name == \"XProtectBehaviorService\"",
+            "dql": {
+              "script": "fieldsAdd tmp_block = contains(content, \"denied\") or contains(content, \"blocked\") or contains(content, \"detected\") or contains(content, \"remediat\") or contains(content, \"malware\")\n| fieldsAdd event.category = if(tmp_block, \"malware\", else: \"configuration\")\n| fieldsAdd event.type = if(macos.subsystem == \"com.apple.syspolicy\", \"gatekeeper\", else: \"xprotect\")\n| fieldsAdd event.outcome = if(tmp_block, \"failure\", else: \"success\")\n| parse content, \"LD ' for ' LD:tmp_path ':'\"\n| fieldsAdd file.path = tmp_path\n| fieldsRemove tmp_block, tmp_path"
+            }
+          },
+          {
+            "id": "macos_privacy_tcc",
+            "type": "dql",
+            "enabled": true,
+            "description": "TCC privacy decisions (camera, mic, Full Disk Access, screen recording...).",
+            "matcher": "macos.subsystem == \"com.apple.TCC\"",
+            "dql": {
+              "script": "fieldsAdd event.category = \"configuration\"\n| fieldsAdd event.type = \"privacy_access\"\n| fieldsAdd event.outcome = if(contains(content, \"denied\") or contains(content, \"Denying\"), \"failure\", else: \"success\")\n| parse content, \"LD 'service=' WORD:tmp_service\"\n| parse content, \"LD 'identifier=' LD:tmp_id ','\"\n| fieldsAdd tcc.service = tmp_service, process.identifier = tmp_id\n| fieldsRemove tmp_service, tmp_id"
+            }
+          },
+          {
+            "id": "macos_persistence_software",
+            "type": "dql",
+            "enabled": true,
+            "description": "Launch/background items (persistence), firewall decisions, installer and software update activity.",
+            "matcher": "macos.subsystem == \"com.apple.backgroundtaskmanagement\" or macos.subsystem == \"com.apple.Firewall\" or process.name == \"socketfilterfw\" or process.name == \"installer\" or process.name == \"pkgd\" or macos.subsystem == \"com.apple.softwareupdate\"",
+            "dql": {
+              "script": "fieldsAdd event.category = if(macos.subsystem == \"com.apple.backgroundtaskmanagement\", \"persistence\", else: if(macos.subsystem == \"com.apple.Firewall\" or process.name == \"socketfilterfw\", \"network\", else: \"package\"))\n| fieldsAdd event.type = \"change\"\n| fieldsAdd event.outcome = if(contains(content, \"fail\") or contains(content, \"Fail\") or contains(content, \"error\") or contains(content, \"denied\"), \"failure\", else: \"success\")"
+            }
+          },
+          {
+            "id": "macos_endpoint_security",
+            "type": "dql",
+            "enabled": true,
+            "description": "Endpoint Security (eslogger) records: event family from the top-level 'event' object key; process identity from the ES process record.",
+            "matcher": "log.source == \"macos:endpoint_security\"",
+            "dql": {
+              "script": "parse content, \"JSON:tmp_es\"\n| fieldsAdd es.action_type = tmp_es[action_type]\n| fieldsAdd es.event_name = if(isNotNull(tmp_es[event][exec]), \"exec\", else: if(isNotNull(tmp_es[event][exit]), \"exit\", else: if(isNotNull(tmp_es[event][fork]), \"fork\", else: if(isNotNull(tmp_es[event][open]), \"open\", else: if(isNotNull(tmp_es[event][create]), \"create\", else: if(isNotNull(tmp_es[event][unlink]), \"unlink\", else: if(isNotNull(tmp_es[event][rename]), \"rename\", else: if(isNotNull(tmp_es[event][setextattr]), \"setextattr\", else: if(isNotNull(tmp_es[event][mount]), \"mount\", else: if(isNotNull(tmp_es[event][unmount]), \"unmount\", else: if(isNotNull(tmp_es[event][login_login]), \"login_login\", else: if(isNotNull(tmp_es[event][login_logout]), \"login_logout\", else: if(isNotNull(tmp_es[event][lw_session_login]), \"lw_session_login\", else: if(isNotNull(tmp_es[event][lw_session_logout]), \"lw_session_logout\", else: if(isNotNull(tmp_es[event][lw_session_lock]), \"lw_session_lock\", else: if(isNotNull(tmp_es[event][lw_session_unlock]), \"lw_session_unlock\", else: if(isNotNull(tmp_es[event][openssh_login]), \"openssh_login\", else: if(isNotNull(tmp_es[event][openssh_logout]), \"openssh_logout\", else: if(isNotNull(tmp_es[event][screensharing_attach]), \"screensharing_attach\", else: if(isNotNull(tmp_es[event][screensharing_detach]), \"screensharing_detach\", else: if(isNotNull(tmp_es[event][su]), \"su\", else: if(isNotNull(tmp_es[event][sudo]), \"sudo\", else: if(isNotNull(tmp_es[event][authentication]), \"authentication\", else: if(isNotNull(tmp_es[event][xp_malware_detected]), \"xp_malware_detected\", else: if(isNotNull(tmp_es[event][xp_malware_remediated]), \"xp_malware_remediated\", else: if(isNotNull(tmp_es[event][btm_launch_item_add]), \"btm_launch_item_add\", else: if(isNotNull(tmp_es[event][btm_launch_item_remove]), \"btm_launch_item_remove\", else: if(isNotNull(tmp_es[event][profile_add]), \"profile_add\", else: if(isNotNull(tmp_es[event][profile_remove]), \"profile_remove\", else: \"other\")))))))))))))))))))))))))))))\n| fieldsAdd event.category = if(in(es.event_name, {\"exec\", \"exit\", \"fork\"}), \"process\", else: if(in(es.event_name, {\"open\", \"create\", \"unlink\", \"rename\", \"setextattr\"}), \"file\", else: if(in(es.event_name, {\"login_login\", \"login_logout\", \"lw_session_login\", \"lw_session_logout\", \"lw_session_lock\", \"lw_session_unlock\", \"openssh_login\", \"openssh_logout\", \"screensharing_attach\", \"screensharing_detach\", \"su\", \"sudo\", \"authentication\"}), \"authentication\", else: if(in(es.event_name, {\"xp_malware_detected\", \"xp_malware_remediated\"}), \"malware\", else: if(in(es.event_name, {\"btm_launch_item_add\", \"btm_launch_item_remove\", \"profile_add\", \"profile_remove\"}), \"persistence\", else: \"host\")))))\n| fieldsAdd event.type = es.event_name\n| fieldsAdd process.command_line = if(es.event_name == \"exec\", toString(tmp_es[event][exec][args]))\n| fieldsAdd process.executable.path = coalesce(tmp_es[event][exec][target][executable][path], process.executable.path)\n| fieldsAdd process.parent.pid = tmp_es[process][ppid]\n| fieldsAdd process.name = arrayLast(splitString(process.executable.path, \"/\"))\n| fieldsRemove tmp_es"
+            }
+          }
+        ]
+      },
+      "dataExtraction": {
+        "processors": [
+          {
+            "id": "extract_macos_security_event",
+            "type": "securityEvent",
+            "enabled": true,
+            "description": "Emit a security event (in addition to the log record, which still lands in Grail) for the notable subset: failed authentication/authorization, failed sudo, account lifecycle, Gatekeeper/XProtect blocks, persistence changes and Endpoint Security malware events. Same provider constant as processing STAGE 0, so detections can read either the log or the event.",
+            "matcher": "(event.category == \"authentication\" and event.outcome == \"failure\") or event.category == \"iam\" or event.category == \"malware\" or event.category == \"persistence\"",
+            "securityEvent": {
+              "fieldExtraction": {
+                "type": "include",
+                "include": [
+                  {
+                    "extractionType": "field",
+                    "sourceFieldName": "event.category"
+                  },
+                  {
+                    "extractionType": "field",
+                    "sourceFieldName": "event.type"
+                  },
+                  {
+                    "extractionType": "field",
+                    "sourceFieldName": "event.outcome"
+                  },
+                  {
+                    "extractionType": "field",
+                    "sourceFieldName": "event.action"
+                  },
+                  {
+                    "extractionType": "field",
+                    "sourceFieldName": "user.name"
+                  },
+                  {
+                    "extractionType": "field",
+                    "sourceFieldName": "user.id"
+                  },
+                  {
+                    "extractionType": "field",
+                    "sourceFieldName": "user.target.name"
+                  },
+                  {
+                    "extractionType": "field",
+                    "sourceFieldName": "source.ip"
+                  },
+                  {
+                    "extractionType": "field",
+                    "sourceFieldName": "host.name"
+                  },
+                  {
+                    "extractionType": "field",
+                    "sourceFieldName": "host.id"
+                  },
+                  {
+                    "extractionType": "field",
+                    "sourceFieldName": "process.name"
+                  },
+                  {
+                    "extractionType": "field",
+                    "sourceFieldName": "process.command_line"
+                  },
+                  {
+                    "extractionType": "field",
+                    "sourceFieldName": "process.executable.path"
+                  },
+                  {
+                    "extractionType": "field",
+                    "sourceFieldName": "file.path"
+                  },
+                  {
+                    "extractionType": "field",
+                    "sourceFieldName": "macos.subsystem"
+                  },
+                  {
+                    "extractionType": "field",
+                    "sourceFieldName": "macos.category"
+                  },
+                  {
+                    "extractionType": "field",
+                    "sourceFieldName": "content"
+                  },
+                  {
+                    "extractionType": "constant",
+                    "constantFieldName": "event.provider",
+                    "constantValue": "macos"
+                  },
+                  {
+                    "extractionType": "constant",
+                    "constantFieldName": "event.kind",
+                    "constantValue": "alert"
+                  }
+                ]
+              }
+            }
+          }
+        ]
+      }
+    }
+  }
+}

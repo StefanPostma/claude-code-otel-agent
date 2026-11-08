@@ -171,7 +171,7 @@ Consequences:
 - **Spans need `telemetry.sdk.name`.** Claude Code's spans reach Grail without any
   `telemetry.sdk.*` attribute, so the extension's span matcher never fires for them while logs
   (matched on `dt.openpipeline.source`) link fine. The collector's `resource/host_identity`
-  therefore *inserts* `telemetry.sdk.name = opentelemetry` when absent. The spans already carry
+  therefore *inserts* `telemetry.sdk.name = opentelemetry` when absent. Likewise the spans/logs carry no `process.*` resource attributes, so the extension's `OTEL_PROCESS_*_enrichment` processors never fire; a second resource processor (traces and logs pipelines only) inserts `process.executable.name = claude`, which resolves to the same `OTEL_PROCESS` id that host_metrics creates for the binary. The spans already carry
   `dt.smartscape.service`, so the `runs_on` SERVICE → OTEL_HOST edge follows.
 
 The routes and pipelines are plain Settings 2.0 objects; `apply-routes.py` reads and writes them

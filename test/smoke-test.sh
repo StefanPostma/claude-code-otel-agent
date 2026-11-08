@@ -16,6 +16,7 @@ LOG="${SMOKE_LOG:-/tmp/claude-code-agent-smoke.log}"
 eval "$(./host-identity/compute-host-id.sh)"
 export STABLE_HOST_ID STABLE_HOST_NAME
 export DT_ENDPOINT="${DT_ENDPOINT:-https://example.live.dynatrace.com}" DT_API_TOKEN="${DT_API_TOKEN:-dummy}"
+export MACOS_SECURITY_LOG_DIR="$(mktemp -d /tmp/cc-smoke-macsec.XXXXXX)"   # fresh filelog checkpoints every run
 
 echo "▶ validate"
 otelcol-contrib validate --config processor/claude-code-agent.yaml --config test/smoke-override.yaml || exit 1
@@ -35,6 +36,7 @@ CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:14318/v1/
 echo "▶ POST sample events → HTTP $CODE"
 sleep 12
 kill $PID 2>/dev/null; wait $PID 2>/dev/null; trap - EXIT
+rm -rf "$MACOS_SECURITY_LOG_DIR"
 
 # Exclude process.command_line lines: the host_metrics `process` scraper captures THIS
 # script's own command line, which would otherwise match the expected strings.
@@ -56,6 +58,7 @@ chk "entity: stable host.id"              "host.id: Str($STABLE_HOST_ID)"
 chk "entity: host.name"                   "host.name: Str($STABLE_HOST_NAME)"
 chk "entity: os.type"                     'os.type: Str('
 chk "entity: telemetry.sdk.name (link)"   'telemetry.sdk.name: Str(opentelemetry)'
+chk "entity: process.executable.name"     'process.executable.name: Str(claude)'
 chk "metric dt.genai.cost.estimated"      'Name: dt.genai.cost.estimated'
 chk "metric gen_ai.client.cost (events)"  'Name: gen_ai.client.cost'
 chk "metric client.token.usage"           'Name: gen_ai.client.token.usage'
@@ -92,6 +95,16 @@ chk "metric claude_code.hook.executions"  'Name: claude_code.hook.executions'
 chk "metric claude_code.subagent.duration" 'Name: claude_code.subagent.duration'
 chk "metric compaction.tokens_reclaimed"  'Name: claude_code.compaction.tokens_reclaimed'
 chk "metric permission_mode.changes"      'Name: claude_code.permission_mode.changes'
+echo "---- macOS security events (unified log fixture) ----"
+chk "M1 log.source resource"           'log.source: Str(macos:unified_log)'
+chk "M1 subsystem mapped"              'macos.subsystem: Str(com.apple.opendirectoryd)'
+chk "M2 process.name from path"        'process.name: Str(sudo)'
+chk "M2 process.pid int"               'process.pid: Int(4242)'
+chk "M3 unified-log timestamp parsed"  'Timestamp: 2026-10-19 21:30:03'
+chk "M3 Error → severity ERROR"        'SeverityText: Error'
+chk "M4 sshd failure body"             'Failed password for invalid user admin'
+chk "M4 Gatekeeper body"               'Gatekeeper assessment denied'
+absent "M5 raw json keys cleaned"      'formatString'
 echo "============================================"
 echo "PASS=$pass FAIL=$fail   (log: $LOG)"
 echo; echo "---- error-level collector log lines ----"

@@ -76,6 +76,7 @@ not deep-code/service topology. [`research/host-entity-model.md`](research/host-
 | `start-collector.sh` · `.ps1` | Derive host id, load `collector.env`, run the collector |
 | `start-monitored-session.sh` | Launch one Claude Code session pointed at the collector (manual alternative to auto-monitoring) |
 | `auto-monitoring/` | Install once → every `claude` session monitored: launchd / systemd / Scheduled Task + `settings.json` redirect; `install.sh`, `install.ps1`, `uninstall.sh` |
+| `macos-security/` | predicate catalogue + unified-log sidecar + optional Endpoint Security (`eslogger`) sidecar |
 | `openpipeline/` | Tenant side of the entity bridge: `routes.json` (3 dynamic routes → OpenTelemetry Host Monitoring pipelines) + `apply-routes.py` (idempotent, via `dtctl`; `--link-claude-code` adds the Smartscape linking stages to the Claude Code GenAI pipelines) |
 | `test/smoke-test.sh` + `sample-claude-code-{trace,logs}.json` + `smoke-override.yaml` | End-to-end verification (46 assertions), nothing sent to Dynatrace; `sample-trace.json` is a generic `gen_ai.*` input for `processor/config.yaml` |
 | `research/` | gap-analysis · metrics-proposal · host-entity-model · **datadog-comparison** (incl. DQL for rereads / retry loops / skipped checks) · fit-fable-rates.js · `pr353-baseline/` (the upstream mapping this builds on) |
@@ -174,10 +175,83 @@ The host page's **Processes** tab (the OneAgent-style per-process table with CPU
 stays at a bare process-count chart until `process.cpu.utilization` arrives, and the hostmetrics
 receiver ships that metric **disabled**. The config therefore enables the same per-process set as
 Dynatrace's reference `host-metrics.yaml` (cpu.utilization, cpu.time, memory.usage,
-memory.virtual, disk.io); with it the tab fills in. The same processes are listed under
+memory.virtual, disk.io); with it the tab fills in. Claude Code's own spans and logs get `process.executable.name = claude` inserted (traces and logs pipelines only, never metrics), so the extension links them to the `OTEL_PROCESS` node of the `claude` binary as well as to the host and draws the SERVICE → OTEL_PROCESS `runs_on` edge. The same processes are listed under
 **OpenTelemetry › Processes** in the sidebar. No low-memory process filter is applied: every
 process becomes an `OTEL_PROCESS` node.
 Background and evidence: [`research/host-entity-model.md`](research/host-entity-model.md) §8–9.
+
+## macOS security events and logs
+
+The agent also ships the Mac's security-relevant system activity, so the same `OTEL_HOST`
+that runs Claude Code carries authentication, privilege, policy and persistence telemetry —
+the kind of coverage a security-focused endpoint integration provides.
+
+**Source 1 — unified log (default, no root).** `macos-security/macos-security-log.sh` polls
+`/usr/bin/log show` every 30 s with one NSPredicate built from
+[`macos-security/predicates.json`](macos-security/predicates.json) and appends matching records
+as NDJSON under `~/.dynatrace-otel/macos-security/`. The collector's `filelog/macos_security`
+receiver tails those files with checkpoints (`file_storage`), so restarts cause neither gaps nor
+duplicates. `start-collector.sh` starts the sidecar on macOS (`MACOS_SECURITY_LOGS=0` disables).
+
+| Category | What it captures | Default |
+|---|---|---|
+| authentication | Open Directory / account-policy results, SSH, screen sharing, login window sessions | on |
+| authorization | authd rights granted/denied (admin prompts, privileged helpers) | on |
+| privilege_escalation | `sudo` use, failures, sudoers violations | on |
+| account_management | `sysadminctl` / `dscl` user and group lifecycle | on |
+| security_policy | Gatekeeper assessments, XProtect detections and remediation | on |
+| privacy_tcc | TCC prompts, denials, overrides (camera, mic, Full Disk Access…) | on |
+| privacy_tcc_grants | every TCC grant — informative but noisy | off |
+| software_changes | installer, package daemon errors, software updates | on |
+| firewall | application firewall decisions | on |
+| launch_persistence | background items / launch agents and daemons added, removed, toggled | on |
+
+Predicates are subsystem-driven on purpose: process-level predicates (`loginwindow`, `tccd`)
+flood the stream with UI chatter. Measure before changing them:
+```bash
+./macos-security/macos-security-log.sh --profile 60m     # records per subsystem/category in the last hour
+./macos-security/macos-security-log.sh --print-predicate
+```
+A typical desktop produces a few hundred records an hour with the defaults.
+
+**Source 2 — Endpoint Security (optional, root + Full Disk Access).** The unified log has no
+reliable process-execution, file or network telemetry; Apple's Endpoint Security framework
+does. `macos-security/eslogger-sidecar.sh` runs Apple's `eslogger` (macOS 13+) for a curated
+event list (exec/exit, file create/unlink/rename, login/logout, lock/unlock, SSH, su/sudo,
+XProtect malware events, launch-item and profile changes) into the same directory, where the
+`filelog/macos_eslogger` receiver picks it up. It is the same source Red Canary's
+[Mac Monitor](https://github.com/Brandon7CC/mac-monitor) uses, but Mac Monitor is a GUI without a
+streaming mode, so the agent uses `eslogger` directly. It is **not** started automatically: it
+needs root and a Full Disk Access grant for the process running it (a LaunchDaemon or `sudo`).
+
+**Collector side** maps the unified-log JSON to OTel/Semantic-Dictionary names
+(`macos.subsystem`, `macos.category`, `process.executable.path`, `process.name`, `process.pid`,
+`user.id`, severity from `messageType`, timestamp from the log line) and stamps
+`log.source = macos:unified_log` or `macos:endpoint_security`. Nothing is classified on the host.
+
+**Dynatrace side — the rule set.** [`openpipeline/macos-security.json`](openpipeline/macos-security.json)
+holds one route and one custom logs pipeline, applied with
+```bash
+./openpipeline/apply-macos-security.py --dry-run
+./openpipeline/apply-macos-security.py
+```
+The route matches on `log.source` and is inserted *before* the OpenTelemetry Host Monitoring
+route (first-match); the script copies the extension's Smartscape stage into the pipeline so the
+records still attach to the `OTEL_HOST`. The pipeline's processing stage follows the same
+Semantic Dictionary contract as a Windows Event Log or auditd pipeline: `event.provider`,
+`event.category` / `event.type` / `event.outcome`, `user.name`, `user.target.name`, `source.ip`,
+`process.command_line`, `authorization.right`, `file.path`, `tcc.service`. Its data-extraction
+stage emits **security events** (`fetch security.events`, `event.provider == "macos"`) for the
+notable subset: failed authentication or authorization, failed `sudo`, account lifecycle,
+Gatekeeper/XProtect blocks, persistence changes and Endpoint Security malware events. The log
+record itself still lands in Grail.
+
+Verify:
+```sql
+fetch logs | filter log.source == "macos:unified_log"
+| summarize count(), by:{event.category, event.type, event.outcome}
+fetch security.events | filter event.provider == "macos" | sort timestamp desc | limit 20
+```
 
 ## Relationship to dynatrace-oss PR #353
 

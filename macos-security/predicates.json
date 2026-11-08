@@ -1,0 +1,56 @@
+{
+  "_comment": "macOS unified-log predicate catalogue for the security sidecar (macos-security-log.sh). Each category is an NSPredicate fragment; enabled categories are OR-ed into one `log show --predicate`. Subsystem/category driven on purpose: process-level predicates (loginwindow, tccd) flood the stream with UI chatter. Measure with `./macos-security/macos-security-log.sh --profile 60m` before enabling a noisy one.",
+  "categories": {
+    "authentication": {
+      "enabled": true,
+      "description": "Local/remote authentication results: Open Directory auth + account policy evaluation, SSH, screen sharing, screen lock/unlock and login window session events.",
+      "predicate": "(subsystem == \"com.apple.AccountPolicy\") OR (subsystem == \"com.apple.opendirectoryd\" AND (category == \"auth\" OR category == \"session\" OR messageType == \"Error\")) OR (process == \"sshd\" OR process == \"sshd-session\" OR subsystem == \"com.apple.sshd\") OR (process == \"screensharingd\") OR (subsystem == \"com.apple.loginwindow\" AND (eventMessage CONTAINS[c] \"login\" OR eventMessage CONTAINS[c] \"logout\" OR eventMessage CONTAINS[c] \"lock\" OR eventMessage CONTAINS[c] \"session\"))"
+    },
+    "authorization": {
+      "enabled": true,
+      "description": "Authorization rights granted/denied by authd (admin prompts, privileged helpers) and securityd authorization decisions.",
+      "predicate": "(subsystem == \"com.apple.Authorization\") OR (subsystem == \"com.apple.securityd\" AND category == \"authorization\")"
+    },
+    "privilege_escalation": {
+      "enabled": true,
+      "description": "sudo audit lines ('<user> : TTY=… ; COMMAND=…', failures, sudoers violations). sudo's debug chatter (config reads, group lookups) is excluded.",
+      "predicate": "(process == \"sudo\" AND eventMessage CONTAINS \" : \")"
+    },
+    "account_management": {
+      "enabled": true,
+      "description": "User/group lifecycle via sysadminctl and dscl (create, delete, password changes, admin group membership).",
+      "predicate": "((process == \"sysadminctl\") OR (process == \"dscl\")) AND subsystem != \"com.apple.xpc\""
+    },
+    "security_policy": {
+      "enabled": true,
+      "description": "Gatekeeper/system policy assessments, XProtect detections and remediation, notarization checks.",
+      "predicate": "(subsystem == \"com.apple.syspolicy\" AND messageType != \"Debug\") OR (subsystem == \"com.apple.XProtect\") OR (process == \"XProtectRemediator\" OR process == \"XProtectBehaviorService\")"
+    },
+    "privacy_tcc": {
+      "enabled": true,
+      "description": "Transparency, Consent and Control: privacy permission prompts, denials and overrides (camera, microphone, Full Disk Access, screen recording).",
+      "predicate": "(subsystem == \"com.apple.TCC\" AND category == \"access\" AND (eventMessage CONTAINS \"Override\" OR eventMessage CONTAINS \"denied\" OR eventMessage CONTAINS \"Prompting\" OR eventMessage CONTAINS \"Denying\"))"
+    },
+    "privacy_tcc_grants": {
+      "enabled": false,
+      "description": "Every TCC grant (\"Granting TCCDProcess …\"). Informative but ~150+ records/hour on a busy desktop. Opt-in.",
+      "predicate": "(subsystem == \"com.apple.TCC\" AND category == \"access\" AND eventMessage CONTAINS \"Granting\")"
+    },
+    "software_changes": {
+      "enabled": true,
+      "description": "Package installs, software updates and installer errors.",
+      "predicate": "(process == \"installer\") OR (process == \"pkgd\" AND messageType == \"Error\") OR (subsystem == \"com.apple.softwareupdate\" AND (eventMessage CONTAINS[c] \"install\" OR eventMessage CONTAINS[c] \"failed\"))"
+    },
+    "firewall": {
+      "enabled": true,
+      "description": "Application firewall decisions.",
+      "predicate": "(subsystem == \"com.apple.Firewall\") OR (process == \"socketfilterfw\")"
+    },
+    "launch_persistence": {
+      "enabled": true,
+      "description": "Background items / launch agents & daemons registered or changed (persistence).",
+      "predicate": "(subsystem == \"com.apple.backgroundtaskmanagement\" AND (eventMessage CONTAINS[c] \"added\" OR eventMessage CONTAINS[c] \"removed\" OR eventMessage CONTAINS[c] \"enabled\" OR eventMessage CONTAINS[c] \"disabled\"))"
+    }
+  },
+  "always": "eventType == \"logEvent\""
+}
