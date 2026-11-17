@@ -1,5 +1,7 @@
 # claude-code-otel-agent
 
+<a href="https://buymeacoffee.com/stefanpostma"><img src="https://img.buymeacoffee.com/button-api/?text=Buy%20me%20a%20coffee&emoji=&slug=stefanpostma&button_colour=FFDD00&font_colour=000000&font_family=Cookie&outline_colour=000000&coffee_colour=ffffff" alt="Buy me a coffee" height="36"></a>
+
 **OneAgent-grade observability for Claude Code — on OpenTelemetry.**
 
 An OTel Collector–based "first agent" that lifts Claude Code's native OTel stream to the
